@@ -253,12 +253,7 @@ st.sidebar.header("🖼️ 후기/사진 설정")
 show_reviews = st.sidebar.checkbox("후기(블로그) 표시", value=True)
 review_display = st.sidebar.slider("식당당 블로그 후기 개수", 1, 3, 2)
 
-# ✅ 사이드바 하단: 기본 디폴트 설정(표시만)
-st.sidebar.divider()
-st.sidebar.subheader("⚙️ 기본 디폴트 설정")
-st.sidebar.write(f"- 인원 수: **{DEFAULT_PEOPLE}명**")
-st.sidebar.write(f"- 이동 거리: **{DISTANCE_OPTIONS[DEFAULT_DISTANCE_INDEX]}**")
-st.sidebar.write(f"- 음식 종류: **{'(선택 없음)' if not DEFAULT_FOOD_TYPES else ', '.join(DEFAULT_FOOD_TYPES)}**")
+
 
 
 # ===============================
