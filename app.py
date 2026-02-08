@@ -293,6 +293,25 @@ def build_cache_key(payload: Dict[str, Any]) -> str:
 # ===============================
 st.set_page_config(page_title="LunchMate 🍱", layout="wide")
 
+# ✅ 스크롤 잠김 방지 CSS (중요)
+st.markdown(
+    """
+    <style>
+    html, body {
+        overflow: auto !important;
+        height: auto !important;
+    }
+    [data-testid="stAppViewContainer"] {
+        overflow: auto !important;
+    }
+    [data-testid="stMain"] {
+        overflow: auto !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True
+)
+
 # ✅ 문구/네이밍: 점심 한정 제거
 st.title("🍽️ LunchMate 🍽️")
 st.caption("사용자님의 상황과 선호도를 바탕으로 음식점/카페 후보 중 최적의 5곳을 추천해 드립니다.")
