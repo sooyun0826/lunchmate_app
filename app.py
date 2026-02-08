@@ -203,29 +203,6 @@ def naver_blog_search_cached(query: str, client_id: str, client_secret: str, dis
     return items
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def naver_cafe_search_cached(query: str, client_id: str, client_secret: str, display: int = 3):
-    url = "https://openapi.naver.com/v1/search/cafearticle.json"
-    headers = {
-        "X-Naver-Client-Id": client_id,
-        "X-Naver-Client-Secret": client_secret,
-    }
-    params = {"query": query, "display": max(1, min(display, 5)), "start": 1, "sort": "sim"}
-    r = requests.get(url, headers=headers, params=params, timeout=10)
-    r.raise_for_status()
-    data = r.json()
-
-    items = []
-    for it in data.get("items", []):
-        items.append({
-            "title": strip_b_tags(html.unescape(it.get("title", ""))),
-            "link": it.get("link", ""),
-            "desc": strip_b_tags(html.unescape(it.get("description", ""))),
-            "thumbnail": it.get("thumbnail", ""),
-        })
-    return items
-
-
 # ===============================
 # Streamlit UI
 # ===============================
@@ -253,8 +230,8 @@ food_type = st.sidebar.multiselect(
 )
 
 st.sidebar.header("🖼️ 후기/사진 설정")
-show_reviews = st.sidebar.checkbox("후기/사진(블로그·카페) 표시", value=True)
-review_display = st.sidebar.slider("식당당 후기 개수", 1, 3, 2)
+show_reviews = st.sidebar.checkbox("후기(블로그) 표시", value=True)
+review_display = st.sidebar.slider("식당당 블로그 후기 개수", 1, 3, 2)
 
 st.subheader("📝 오늘의 상황을 입력해 주세요")
 situation = st.text_area(
@@ -419,49 +396,33 @@ if st.button("🤖 점심 추천 받기"):
                 else:
                     st.write("🔗 **링크**: 정보 없음")
 
-            # 후기/사진(블로그·카페)
+            # ✅ 후기(블로그만)
             if show_reviews:
                 q = make_review_query(r.get("name", ""), r.get("address", ""))
-                with st.expander("🖼️ 후기/사진(블로그·카페) 보기"):
+                with st.expander("🖼️ 블로그 후기 보기"):
                     st.caption(f"검색어: {q}")
 
                     try:
                         blog_posts = naver_blog_search_cached(
                             q, naver_client_id, naver_client_secret, display=review_display
                         )
-                        cafe_posts = naver_cafe_search_cached(
-                            q, naver_client_id, naver_client_secret, display=review_display
-                        )
                     except Exception:
-                        blog_posts, cafe_posts = [], []
+                        blog_posts = []
                         st.write("후기 검색에 실패했어요. 잠시 후 다시 시도해 주세요.")
 
-                    if not blog_posts and not cafe_posts:
-                        st.write("관련 후기를 찾지 못했어요.")
+                    if not blog_posts:
+                        st.write("관련 블로그 후기를 찾지 못했어요.")
                     else:
-                        if blog_posts:
-                            st.markdown("**📝 블로그 후기**")
-                            for p in blog_posts[:review_display]:
-                                cols = st.columns([1, 3])
-                                with cols[0]:
-                                    if p.get("thumbnail"):
-                                        st.image(p["thumbnail"], use_container_width=True)
-                                with cols[1]:
-                                    st.markdown(f"- [{p['title']}]({p['link']})")
-                                    if p.get("desc"):
-                                        st.caption(p["desc"])
-
-                        if cafe_posts:
-                            st.markdown("**💬 카페 후기**")
-                            for p in cafe_posts[:review_display]:
-                                cols = st.columns([1, 3])
-                                with cols[0]:
-                                    if p.get("thumbnail"):
-                                        st.image(p["thumbnail"], use_container_width=True)
-                                with cols[1]:
-                                    st.markdown(f"- [{p['title']}]({p['link']})")
-                                    if p.get("desc"):
-                                        st.caption(p["desc"])
+                        st.markdown("**📝 블로그 후기**")
+                        for p in blog_posts[:review_display]:
+                            cols = st.columns([1, 3])
+                            with cols[0]:
+                                if p.get("thumbnail"):
+                                    st.image(p["thumbnail"], use_container_width=True)
+                            with cols[1]:
+                                st.markdown(f"- [{p['title']}]({p['link']})")
+                                if p.get("desc"):
+                                    st.caption(p["desc"])
 
             st.divider()
 
