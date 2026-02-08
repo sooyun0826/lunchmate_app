@@ -11,7 +11,8 @@ from openai import OpenAI
 
 
 # ===============================
-# 기본 디폴트 설정 (사이드바 하단에도 표시됨)
+# 기본 디폴트 설정 (초기값)
+# - 사용자가 사이드바에서 변경 가능
 # ===============================
 DEFAULT_PEOPLE = 2
 DISTANCE_OPTIONS = ["5분 이내", "10분 이내", "상관없음"]
@@ -220,9 +221,17 @@ st.set_page_config(page_title="LunchMate 🍱", layout="wide")
 st.title("🍽️ LunchMate")
 st.caption("사용자님의 상황과 선호도를 바탕으로 관련된 음식점 후보 중 최적의 3곳을 추천해 드립니다")
 
+# ✅ Secrets는 '표시'만 제거하고, 로직을 위해서는 반드시 로드해야 함
+naver_client_id = get_secret("NAVER_CLIENT_ID")
+naver_client_secret = get_secret("NAVER_CLIENT_SECRET")
+openai_api_key = get_secret("OPENAI_API_KEY")
+
+# ===============================
+# 사이드바: 검색 조건
+# ===============================
 st.sidebar.header("🔍 검색 조건")
 
-# ✅ 디폴트: 인원수 2
+# ✅ 디폴트: 인원수 2 (초기값)
 people = st.sidebar.slider(
     "인원 수",
     min_value=1,
@@ -230,14 +239,14 @@ people = st.sidebar.slider(
     value=DEFAULT_PEOPLE,
 )
 
-# ✅ 디폴트: 이동거리 "상관없음"
+# ✅ 디폴트: 이동거리 "상관없음" (초기값)
 distance = st.sidebar.selectbox(
     "이동 거리",
     DISTANCE_OPTIONS,
     index=DEFAULT_DISTANCE_INDEX,
 )
 
-# ✅ 디폴트: 음식 조건 아무 것도 선택 안 됨
+# ✅ 디폴트: 음식 조건 아무 것도 선택 안 됨 (초기값)
 food_type = st.sidebar.multiselect(
     "음식 종류",
     FOOD_OPTIONS,
@@ -248,13 +257,55 @@ st.sidebar.header("🖼️ 후기/사진 설정")
 show_reviews = st.sidebar.checkbox("후기(블로그) 표시", value=True)
 review_display = st.sidebar.slider("식당당 블로그 후기 개수", 1, 3, 2)
 
-# ✅ 사이드바 하단: 기본 디폴트 설정 블록 추가
+# ===============================
+# ✅ 사이드바 하단: "기본 디폴트 설정"을 사용자가 직접 수정 가능하게
+# - 이 값은 "리셋" 버튼으로 즉시 적용(다음 렌더부터 반영)
+# ===============================
 st.sidebar.divider()
-st.sidebar.subheader("⚙️ 기본 디폴트 설정")
-st.sidebar.write(f"- 인원 수: **{DEFAULT_PEOPLE}명**")
-st.sidebar.write(f"- 이동 거리: **{DISTANCE_OPTIONS[DEFAULT_DISTANCE_INDEX]}**")
-st.sidebar.write(f"- 음식 종류: **{'(선택 없음)' if not DEFAULT_FOOD_TYPES else ', '.join(DEFAULT_FOOD_TYPES)}**")
+st.sidebar.subheader("⚙️ 기본 디폴트 설정(사용자 편집)")
 
+new_default_people = st.sidebar.number_input(
+    "기본 인원 수",
+    min_value=1,
+    max_value=10,
+    value=DEFAULT_PEOPLE,
+    step=1,
+)
+
+new_default_distance = st.sidebar.selectbox(
+    "기본 이동 거리",
+    DISTANCE_OPTIONS,
+    index=DEFAULT_DISTANCE_INDEX,
+)
+
+new_default_foods = st.sidebar.multiselect(
+    "기본 음식 종류(초기 선택)",
+    FOOD_OPTIONS,
+    default=DEFAULT_FOOD_TYPES,
+)
+
+st.sidebar.caption("아래 버튼을 누르면 위 설정이 '현재 입력값'에 적용됩니다.")
+
+if st.sidebar.button("🔁 기본값으로 리셋 적용"):
+    # Streamlit은 위젯 value를 런타임에 직접 바꾸기 어렵기 때문에
+    # session_state로 초기값을 재세팅하고 rerun으로 적용한다.
+    st.session_state["people"] = int(new_default_people)
+    st.session_state["distance"] = new_default_distance
+    st.session_state["food_type"] = list(new_default_foods)
+    st.rerun()
+
+# 사용자가 리셋 버튼을 누른 경우 세션값을 우선 적용
+if "people" in st.session_state:
+    people = st.session_state["people"]
+if "distance" in st.session_state:
+    distance = st.session_state["distance"]
+if "food_type" in st.session_state:
+    food_type = st.session_state["food_type"]
+
+
+# ===============================
+# 메인 입력
+# ===============================
 st.subheader("📝 오늘의 상황을 입력해 주세요")
 situation = st.text_area(
     "자연스럽게 입력해 주세요",
@@ -282,12 +333,13 @@ if st.button("🤖 점심 추천 받기"):
         st.warning("상황을 입력해 주세요.")
         st.stop()
 
+    # 🔒 연결 상태 UI는 숨겼지만, 설정이 없으면 서비스가 동작할 수 없어서 여기서만 검사
     if not (naver_client_id and naver_client_secret):
-        st.error("네이버 Client ID/Secret이 없습니다. Streamlit Cloud의 Secrets에 등록해 주세요.")
+        st.error("서비스 설정 오류가 발생했습니다. 잠시 후 다시 시도해 주세요.")
         st.stop()
 
     if not openai_api_key:
-        st.error("OpenAI API Key가 없습니다. Streamlit Cloud의 Secrets에 OPENAI_API_KEY로 등록해 주세요.")
+        st.error("서비스 설정 오류가 발생했습니다. 잠시 후 다시 시도해 주세요.")
         st.stop()
 
     client = OpenAI(api_key=openai_api_key)
