@@ -259,7 +259,7 @@ review_display = st.sidebar.slider("식당당 후기 개수", 1, 3, 2)
 st.subheader("📝 오늘의 상황을 입력해 주세요")
 situation = st.text_area(
     "자연스럽게 입력해 주세요",
-    placeholder="예: 오늘 친구들과 신촌역 근처에서 점심 식사를 하려고 해. 분위기 좋은 식당으로 추천해줘.",
+    placeholder="예: 오늘 친구들과 신촌역 근처에서 점심 식사를 하려고 해. 분위기 좋은 중식 식당으로 추천해줘.",
 )
 
 col1, col2, col3 = st.columns(3)
