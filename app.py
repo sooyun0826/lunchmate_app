@@ -557,7 +557,7 @@ debug_mode = st.sidebar.checkbox("🧪 디버그(후보 점수/필터 보기)", 
 st.subheader("📝 희망 조건을 자유롭게 입력해 주세요")
 situation = st.text_area(
     "자연스럽게 입력해 주세요(취향, 방문 지역, 방문자 수, 상황 등)",
-    placeholder="예: 별내동 점심에 혼자 가기 좋은 가성비 맛집 추천해줘. / 을지로에서 분위기 좋은 술집 찾고 있어.",
+    placeholder="예: 오늘 신촌역 근처에서 친구랑 점심 먹을거야. 분위기 좋은 중식점 추천해줘. / 잠실에서 카공하기 좋은 카페 찾아줘.",
 )
 
 col1, col2, col3, col4 = st.columns(4)
