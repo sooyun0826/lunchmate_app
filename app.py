@@ -13,13 +13,14 @@ from openai import OpenAI
 # 유틸
 # ===============================
 def strip_b_tags(text: str) -> str:
+    """네이버 지역검색 결과 title에 섞여오는 <b> 태그 제거"""
     if not text:
         return ""
     return re.sub(r"</?b>", "", text)
 
 
 def get_secret(key: str) -> str:
-    """Streamlit Cloud Secrets에서만 읽기 (사이드바 입력 제거)"""
+    """Streamlit Cloud Secrets에서만 읽기"""
     return str(st.secrets.get(key, "")).strip()
 
 
@@ -64,6 +65,7 @@ def naver_local_search(
 
 
 def dedupe_candidates(candidates: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """이름+주소 기준으로 후보 중복 제거"""
     seen = set()
     uniq = []
     for c in candidates:
@@ -77,10 +79,10 @@ def dedupe_candidates(candidates: List[Dict[str, str]]) -> List[Dict[str, str]]:
 
 def extract_json_from_text(text: str) -> dict:
     """
-    모델이 JSON 외 텍스트를 섞었을 때를 대비해,
-    가장 바깥 JSON 객체를 찾아 파싱 시도.
+    모델이 JSON 외 텍스트를 섞었을 때를 대비해
+    가장 바깥 JSON 객체를 찾아 파싱 시도
     """
-    text = text.strip()
+    text = (text or "").strip()
 
     # 이미 JSON이면 바로
     try:
@@ -103,9 +105,8 @@ def extract_json_from_text(text: str) -> dict:
 
 def llm_json(client: OpenAI, system: str, user: str, model: str = "gpt-4.1-mini", retries: int = 2) -> dict:
     """
-    chat.completions 기반 JSON 응답 강제.
-    SDK 호환성을 위해 response_format(json_schema) 대신 프롬프트로 강제하고,
-    파싱 실패 시 짧게 재시도.
+    chat.completions 기반 JSON 응답 강제
+    (response_format(json_schema) 대신 프롬프트로 강제)
     """
     for attempt in range(retries + 1):
         resp = client.chat.completions.create(
@@ -122,13 +123,63 @@ def llm_json(client: OpenAI, system: str, user: str, model: str = "gpt-4.1-mini"
         except json.JSONDecodeError:
             if attempt == retries:
                 raise
-            # 재시도: 더 강하게 “JSON만” 요구
-            user = (
-                user
-                + "\n\n너의 직전 출력은 JSON 파싱에 실패했어. "
-                  "다른 텍스트 없이 JSON만 다시 출력해."
-            )
+            user = user + "\n\n다른 텍스트 없이 JSON만 다시 출력해."
     raise RuntimeError("Unreachable")
+
+
+def ensure_three_recommendations(
+    recommendations: List[Dict[str, str]],
+    candidates: List[Dict[str, str]],
+) -> List[Dict[str, str]]:
+    """
+    추천 결과가 3개 미만이면 candidates에서 부족분을 채워 3개로 맞춤
+    - 중복(이름+주소) 제거
+    - rank를 1~3으로 재정렬
+    """
+    def _key(name: str, address: str) -> tuple:
+        return (str(name or "").strip(), str(address or "").strip())
+
+    # 1) 추천 결과 정리(중복 제거 + 유효 dict만)
+    recs = [r for r in recommendations if isinstance(r, dict)]
+    recs = sorted(recs, key=lambda x: int(x.get("rank", 999)))
+
+    picked = set()
+    cleaned = []
+    for r in recs:
+        k = _key(r.get("name", ""), r.get("address", ""))
+        if k in picked:
+            continue
+        picked.add(k)
+        cleaned.append(r)
+    recs = cleaned
+
+    # 2) 부족분 candidates에서 채우기
+    if len(recs) < 3:
+        for c in candidates:
+            k = _key(c.get("name", ""), c.get("address", ""))
+            if k in picked:
+                continue
+            picked.add(k)
+            recs.append({
+                "rank": len(recs) + 1,
+                "name": c.get("name", ""),
+                "reason": "후보 식당 중 조건과 무난하게 잘 맞는 선택지입니다.",
+                "address": c.get("address", ""),
+                "category": c.get("category", ""),
+                "tel": c.get("tel", ""),
+                "link": c.get("link", ""),
+            })
+            if len(recs) == 3:
+                break
+
+    # 3) 그래도 3개 미만이면(후보가 매우 적은 경우) 가능한 만큼만
+    recs = recs[:3]
+
+    # 4) rank 재정렬
+    for i, r in enumerate(recs, start=1):
+        r["rank"] = i
+
+    return recs
 
 
 # ===============================
@@ -138,7 +189,7 @@ st.set_page_config(page_title="LunchMate 🍱", layout="wide")
 st.title("🍽️ LunchMate")
 st.caption("직장인의 상황과 선호도를 분석해 ‘실제로 존재하는’ 식당 후보 중 최적의 3곳을 추천합니다")
 
-# Secrets 상태 표시(입력칸 없음)
+# Secrets 상태 표시
 st.sidebar.header("🔐 연결 상태")
 naver_client_id = get_secret("NAVER_CLIENT_ID")
 naver_client_secret = get_secret("NAVER_CLIENT_SECRET")
@@ -199,8 +250,7 @@ if st.button("🤖 점심 추천 받기"):
         "너는 네이버 지역검색 API에 넣을 '검색어'를 생성하는 도우미다.\n"
         "- 식당 이름을 절대 만들지 마라.\n"
         "- 검색에 잘 걸릴 짧은 키워드 조합만 만들어라.\n"
-        "- 출력은 JSON만. 스키마:\n"
-        "{ \"queries\": [\"...\", \"...\"] }\n"
+        "- 출력은 JSON만. 스키마: { \"queries\": [\"...\", \"...\"] }\n"
         "- queries는 2~6개."
     )
     user_query = (
@@ -258,6 +308,7 @@ if st.button("🤖 점심 추천 받기"):
         "- 반드시 candidates 목록에 있는 식당만 추천할 수 있다.\n"
         "- candidates에 없는 식당을 새로 만들면 실패다.\n"
         "- 숫자(평점/가격/거리/시간)는 근거 데이터가 없으면 절대 지어내지 마라.\n"
+        "- 추천은 최대 3개.\n"
         "- 출력은 JSON만. 스키마:\n"
         "{\n"
         "  \"summary\": \"한 줄 결론\",\n"
@@ -265,7 +316,6 @@ if st.button("🤖 점심 추천 받기"):
         "    {\"rank\": 1, \"name\": \"...\", \"reason\": \"...\", \"address\": \"...\", \"category\": \"...\", \"tel\": \"...\", \"link\": \"...\"}\n"
         "  ]\n"
         "}\n"
-        "- recommendations는 1~3개, rank는 1부터."
     )
 
     payload = {
@@ -273,7 +323,7 @@ if st.button("🤖 점심 추천 받기"):
         "people": people,
         "distance_pref": distance,
         "food_type": food_type,
-        "candidates": candidates[:25],  # 너무 길면 혼란 -> 제한
+        "candidates": candidates[:25],
     }
     user_rec = json.dumps(payload, ensure_ascii=False)
 
@@ -296,30 +346,39 @@ if st.button("🤖 점심 추천 받기"):
     recommendations = sorted(recommendations, key=lambda x: int(x.get("rank", 999)))
     recommendations = recommendations[:3]
 
-    # UI 출력
+    # ✅ 3개 보정 로직 적용
+    recommendations = ensure_three_recommendations(recommendations, candidates)
+
+    # ===============================
+    # 출력 UI (더 깔끔하게)
+    # ===============================
     st.success(f"✅ **{summary}**")
 
     st.subheader("🏆 추천 식당 TOP 3 (네이버 후보 기반)")
+
     for r in recommendations:
         with st.container():
-            st.markdown(f"### {r.get('rank', '')}️⃣ {r.get('name', '이름 없음')}")
-            st.write(f"📌 추천 이유: {r.get('reason', '')}")
-            st.write(f"🏷️ 카테고리: {r.get('category', '') or '정보 없음'}")
-            st.write(f"📍 주소: {r.get('address', '') or '정보 없음'}")
-            st.write(f"☎️ 전화: {r.get('tel', '') or '정보 없음'}")
-            if r.get("link"):
-                st.markdown(f"🔗 링크: {r['link']}")
+            left, right = st.columns([3, 2])
+
+            with left:
+                st.markdown(f"### {r.get('rank', '')}️⃣ {r.get('name', '이름 없음')}")
+                st.write(f"📌 **추천 이유**: {r.get('reason', '')}")
+                st.write(f"🏷️ **카테고리**: {r.get('category', '') or '정보 없음'}")
+                st.write(f"📍 **주소**: {r.get('address', '') or '정보 없음'}")
+
+            with right:
+                st.write(f"☎️ **전화**: {r.get('tel', '') or '정보 없음'}")
+                if r.get("link"):
+                    st.link_button("네이버/예약 링크 열기", r["link"])
+                else:
+                    st.write("🔗 **링크**: 정보 없음")
+
             st.divider()
 
-    st.subheader("📋 비교 표")
+    st.subheader("📋 추천 결과 요약표")
     df = pd.DataFrame(recommendations)
     cols = [c for c in ["rank", "name", "category", "address", "tel", "link"] if c in df.columns]
     st.dataframe(df[cols], use_container_width=True, hide_index=True)
-
-    # 간단 차트(“카테고리 정보량”처럼 검증 가능한 값만)
-    st.subheader("📈 정보량 비교(카테고리 글자수)")
-    df["category_len"] = df.get("category", "").fillna("").astype(str).apply(len)
-    st.bar_chart(df.set_index("name")["category_len"])
 
 else:
     st.info("👆 상황을 입력하고 **점심 추천 받기** 버튼을 눌러주세요.")
