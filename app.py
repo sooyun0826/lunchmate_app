@@ -1,7 +1,8 @@
 import json
 import re
 import time
-from typing import List, Dict
+import html
+from typing import List, Dict, Any
 
 import requests
 import streamlit as st
@@ -13,7 +14,7 @@ from openai import OpenAI
 # 유틸
 # ===============================
 def strip_b_tags(text: str) -> str:
-    """네이버 지역검색 결과 title에 섞여오는 <b> 태그 제거"""
+    """네이버 검색 API 응답에 섞여오는 <b> 태그 제거"""
     if not text:
         return ""
     return re.sub(r"</?b>", "", text)
@@ -78,22 +79,16 @@ def dedupe_candidates(candidates: List[Dict[str, str]]) -> List[Dict[str, str]]:
 
 
 def extract_json_from_text(text: str) -> dict:
-    """
-    모델이 JSON 외 텍스트를 섞었을 때를 대비해
-    가장 바깥 JSON 객체를 찾아 파싱 시도
-    """
+    """모델이 JSON 외 텍스트를 섞었을 때 가장 바깥 JSON 객체를 찾아 파싱"""
     text = (text or "").strip()
 
-    # 이미 JSON이면 바로
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
 
-    # 코드블록 제거
     text = text.replace("```json", "```").replace("```", "")
 
-    # 첫 { 부터 마지막 } 까지 추출
     start = text.find("{")
     end = text.rfind("}")
     if start == -1 or end == -1 or end <= start:
@@ -104,10 +99,7 @@ def extract_json_from_text(text: str) -> dict:
 
 
 def llm_json(client: OpenAI, system: str, user: str, model: str = "gpt-4.1-mini", retries: int = 2) -> dict:
-    """
-    chat.completions 기반 JSON 응답 강제
-    (response_format(json_schema) 대신 프롬프트로 강제)
-    """
+    """chat.completions 기반 JSON 응답 강제"""
     for attempt in range(retries + 1):
         resp = client.chat.completions.create(
             model=model,
@@ -128,18 +120,17 @@ def llm_json(client: OpenAI, system: str, user: str, model: str = "gpt-4.1-mini"
 
 
 def ensure_three_recommendations(
-    recommendations: List[Dict[str, str]],
+    recommendations: List[Dict[str, Any]],
     candidates: List[Dict[str, str]],
-) -> List[Dict[str, str]]:
+) -> List[Dict[str, Any]]:
     """
     추천 결과가 3개 미만이면 candidates에서 부족분을 채워 3개로 맞춤
     - 중복(이름+주소) 제거
-    - rank를 1~3으로 재정렬
+    - rank 1~3 재정렬
     """
     def _key(name: str, address: str) -> tuple:
         return (str(name or "").strip(), str(address or "").strip())
 
-    # 1) 추천 결과 정리(중복 제거 + 유효 dict만)
     recs = [r for r in recommendations if isinstance(r, dict)]
     recs = sorted(recs, key=lambda x: int(x.get("rank", 999)))
 
@@ -153,7 +144,6 @@ def ensure_three_recommendations(
         cleaned.append(r)
     recs = cleaned
 
-    # 2) 부족분 candidates에서 채우기
     if len(recs) < 3:
         for c in candidates:
             k = _key(c.get("name", ""), c.get("address", ""))
@@ -172,14 +162,68 @@ def ensure_three_recommendations(
             if len(recs) == 3:
                 break
 
-    # 3) 그래도 3개 미만이면(후보가 매우 적은 경우) 가능한 만큼만
     recs = recs[:3]
-
-    # 4) rank 재정렬
     for i, r in enumerate(recs, start=1):
         r["rank"] = i
-
     return recs
+
+
+def make_review_query(name: str, address: str) -> str:
+    """
+    후기 검색용 쿼리 생성:
+    - 식당명 + 주소 앞부분(시/구/동 정도) + '후기'
+    """
+    name = (name or "").strip()
+    address = (address or "").strip()
+    addr_hint = " ".join(address.split()[:3])  # 예: '서울특별시 노원구 동일로...'
+    q = f"{name} {addr_hint} 후기".strip()
+    return re.sub(r"\s+", " ", q)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def naver_blog_search_cached(query: str, client_id: str, client_secret: str, display: int = 3):
+    url = "https://openapi.naver.com/v1/search/blog.json"
+    headers = {
+        "X-Naver-Client-Id": client_id,
+        "X-Naver-Client-Secret": client_secret,
+    }
+    params = {"query": query, "display": max(1, min(display, 5)), "start": 1, "sort": "sim"}
+    r = requests.get(url, headers=headers, params=params, timeout=10)
+    r.raise_for_status()
+    data = r.json()
+
+    items = []
+    for it in data.get("items", []):
+        items.append({
+            "title": strip_b_tags(html.unescape(it.get("title", ""))),
+            "link": it.get("link", ""),
+            "desc": strip_b_tags(html.unescape(it.get("description", ""))),
+            "thumbnail": it.get("thumbnail", ""),
+        })
+    return items
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def naver_cafe_search_cached(query: str, client_id: str, client_secret: str, display: int = 3):
+    url = "https://openapi.naver.com/v1/search/cafearticle.json"
+    headers = {
+        "X-Naver-Client-Id": client_id,
+        "X-Naver-Client-Secret": client_secret,
+    }
+    params = {"query": query, "display": max(1, min(display, 5)), "start": 1, "sort": "sim"}
+    r = requests.get(url, headers=headers, params=params, timeout=10)
+    r.raise_for_status()
+    data = r.json()
+
+    items = []
+    for it in data.get("items", []):
+        items.append({
+            "title": strip_b_tags(html.unescape(it.get("title", ""))),
+            "link": it.get("link", ""),
+            "desc": strip_b_tags(html.unescape(it.get("description", ""))),
+            "thumbnail": it.get("thumbnail", ""),
+        })
+    return items
 
 
 # ===============================
@@ -207,6 +251,10 @@ food_type = st.sidebar.multiselect(
     ["한식", "중식", "일식", "양식", "분식", "기타"],
     default=["한식"],
 )
+
+st.sidebar.header("🖼️ 후기/사진 설정")
+show_reviews = st.sidebar.checkbox("후기/사진(블로그·카페) 표시", value=True)
+review_display = st.sidebar.slider("식당당 후기 개수", 1, 3, 2)
 
 st.subheader("📝 오늘의 상황을 입력해 주세요")
 situation = st.text_area(
@@ -341,12 +389,10 @@ if st.button("🤖 점심 추천 받기"):
         st.error("추천 결과 형식이 올바르지 않습니다. 다시 시도해 주세요.")
         st.stop()
 
-    # 정렬 및 최대 3개로 강제
+    # 정렬 및 최대 3개로 강제 + 3개 보정
     recommendations = [r for r in recommendations if isinstance(r, dict)]
     recommendations = sorted(recommendations, key=lambda x: int(x.get("rank", 999)))
     recommendations = recommendations[:3]
-
-    # ✅ 3개 보정 로직 적용
     recommendations = ensure_three_recommendations(recommendations, candidates)
 
     # ===============================
@@ -372,6 +418,50 @@ if st.button("🤖 점심 추천 받기"):
                     st.link_button("네이버/예약 링크 열기", r["link"])
                 else:
                     st.write("🔗 **링크**: 정보 없음")
+
+            # 후기/사진(블로그·카페)
+            if show_reviews:
+                q = make_review_query(r.get("name", ""), r.get("address", ""))
+                with st.expander("🖼️ 후기/사진(블로그·카페) 보기"):
+                    st.caption(f"검색어: {q}")
+
+                    try:
+                        blog_posts = naver_blog_search_cached(
+                            q, naver_client_id, naver_client_secret, display=review_display
+                        )
+                        cafe_posts = naver_cafe_search_cached(
+                            q, naver_client_id, naver_client_secret, display=review_display
+                        )
+                    except Exception:
+                        blog_posts, cafe_posts = [], []
+                        st.write("후기 검색에 실패했어요. 잠시 후 다시 시도해 주세요.")
+
+                    if not blog_posts and not cafe_posts:
+                        st.write("관련 후기를 찾지 못했어요.")
+                    else:
+                        if blog_posts:
+                            st.markdown("**📝 블로그 후기**")
+                            for p in blog_posts[:review_display]:
+                                cols = st.columns([1, 3])
+                                with cols[0]:
+                                    if p.get("thumbnail"):
+                                        st.image(p["thumbnail"], use_container_width=True)
+                                with cols[1]:
+                                    st.markdown(f"- [{p['title']}]({p['link']})")
+                                    if p.get("desc"):
+                                        st.caption(p["desc"])
+
+                        if cafe_posts:
+                            st.markdown("**💬 카페 후기**")
+                            for p in cafe_posts[:review_display]:
+                                cols = st.columns([1, 3])
+                                with cols[0]:
+                                    if p.get("thumbnail"):
+                                        st.image(p["thumbnail"], use_container_width=True)
+                                with cols[1]:
+                                    st.markdown(f"- [{p['title']}]({p['link']})")
+                                    if p.get("desc"):
+                                        st.caption(p["desc"])
 
             st.divider()
 
