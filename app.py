@@ -9,6 +9,8 @@ import streamlit as st
 import pandas as pd
 from openai import OpenAI
 
+from bs4 import BeautifulSoup  # ✅ 추가(og:image 추출용)
+
 
 # ===============================
 # 유틸
@@ -175,7 +177,7 @@ def make_review_query(name: str, address: str) -> str:
     """
     name = (name or "").strip()
     address = (address or "").strip()
-    addr_hint = " ".join(address.split()[:3])  # 예: '서울특별시 노원구 동일로...'
+    addr_hint = " ".join(address.split()[:3])
     q = f"{name} {addr_hint} 후기".strip()
     return re.sub(r"\s+", " ", q)
 
@@ -226,6 +228,43 @@ def naver_cafe_search_cached(query: str, client_id: str, client_secret: str, dis
     return items
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_og_image(url: str) -> str:
+    """
+    후기 링크 페이지에서 대표 이미지(og:image)를 추출
+    - 성공 시 이미지 URL 반환
+    - 실패 시 빈 문자열 반환
+    """
+    try:
+        headers = {"User-Agent": "Mozilla/5.0"}
+        r = requests.get(url, headers=headers, timeout=8)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+
+        tag = soup.find("meta", attrs={"property": "og:image"})
+        if tag and tag.get("content"):
+            return tag["content"].strip()
+    except Exception:
+        return ""
+    return ""
+
+
+def best_post_image(post: Dict[str, str]) -> str:
+    """
+    1) 검색 API thumbnail 우선
+    2) 없으면 링크에서 og:image 추출 시도
+    """
+    thumb = (post.get("thumbnail") or "").strip()
+    if thumb:
+        return thumb
+
+    link = (post.get("link") or "").strip()
+    if not link:
+        return ""
+
+    return fetch_og_image(link)
+
+
 # ===============================
 # Streamlit UI
 # ===============================
@@ -255,6 +294,7 @@ food_type = st.sidebar.multiselect(
 st.sidebar.header("🖼️ 후기/사진 설정")
 show_reviews = st.sidebar.checkbox("후기/사진(블로그·카페) 표시", value=True)
 review_display = st.sidebar.slider("식당당 후기 개수", 1, 3, 2)
+show_images = st.sidebar.checkbox("후기 대표 이미지(가능할 때) 표시", value=True)
 
 st.subheader("📝 오늘의 상황을 입력해 주세요")
 situation = st.text_area(
@@ -389,17 +429,15 @@ if st.button("🤖 점심 추천 받기"):
         st.error("추천 결과 형식이 올바르지 않습니다. 다시 시도해 주세요.")
         st.stop()
 
-    # 정렬 및 최대 3개로 강제 + 3개 보정
     recommendations = [r for r in recommendations if isinstance(r, dict)]
     recommendations = sorted(recommendations, key=lambda x: int(x.get("rank", 999)))
     recommendations = recommendations[:3]
     recommendations = ensure_three_recommendations(recommendations, candidates)
 
     # ===============================
-    # 출력 UI (더 깔끔하게)
+    # 출력 UI
     # ===============================
     st.success(f"✅ **{summary}**")
-
     st.subheader("🏆 추천 식당 TOP 3 (네이버 후보 기반)")
 
     for r in recommendations:
@@ -444,8 +482,10 @@ if st.button("🤖 점심 추천 받기"):
                             for p in blog_posts[:review_display]:
                                 cols = st.columns([1, 3])
                                 with cols[0]:
-                                    if p.get("thumbnail"):
-                                        st.image(p["thumbnail"], use_container_width=True)
+                                    if show_images:
+                                        img = best_post_image(p)
+                                        if img:
+                                            st.image(img, use_container_width=True)
                                 with cols[1]:
                                     st.markdown(f"- [{p['title']}]({p['link']})")
                                     if p.get("desc"):
@@ -456,8 +496,10 @@ if st.button("🤖 점심 추천 받기"):
                             for p in cafe_posts[:review_display]:
                                 cols = st.columns([1, 3])
                                 with cols[0]:
-                                    if p.get("thumbnail"):
-                                        st.image(p["thumbnail"], use_container_width=True)
+                                    if show_images:
+                                        img = best_post_image(p)
+                                        if img:
+                                            st.image(img, use_container_width=True)
                                 with cols[1]:
                                     st.markdown(f"- [{p['title']}]({p['link']})")
                                     if p.get("desc"):
