@@ -366,14 +366,13 @@ if st.button("🤖 점심 추천 받기"):
         st.error("추천 결과 형식이 올바르지 않습니다. 다시 시도해 주세요.")
         st.stop()
 
-    # 정렬 및 최대 3개로 강제 + 3개 보정
     recommendations = [r for r in recommendations if isinstance(r, dict)]
     recommendations = sorted(recommendations, key=lambda x: int(x.get("rank", 999)))
     recommendations = recommendations[:3]
     recommendations = ensure_three_recommendations(recommendations, candidates)
 
     # ===============================
-    # 출력 UI (더 깔끔하게)
+    # 출력 UI (전화 정보 제거)
     # ===============================
     st.success(f"✅ **{summary}**")
 
@@ -390,13 +389,11 @@ if st.button("🤖 점심 추천 받기"):
                 st.write(f"📍 **주소**: {r.get('address', '') or '정보 없음'}")
 
             with right:
-                st.write(f"☎️ **전화**: {r.get('tel', '') or '정보 없음'}")
                 if r.get("link"):
                     st.link_button("네이버/예약 링크 열기", r["link"])
                 else:
                     st.write("🔗 **링크**: 정보 없음")
 
-            # ✅ 후기(블로그만)
             if show_reviews:
                 q = make_review_query(r.get("name", ""), r.get("address", ""))
                 with st.expander("🖼️ 블로그 후기 보기"):
@@ -428,7 +425,7 @@ if st.button("🤖 점심 추천 받기"):
 
     st.subheader("📋 추천 결과 요약표")
     df = pd.DataFrame(recommendations)
-    cols = [c for c in ["rank", "name", "category", "address", "tel", "link"] if c in df.columns]
+    cols = [c for c in ["rank", "name", "category", "address", "link"] if c in df.columns]
     st.dataframe(df[cols], use_container_width=True, hide_index=True)
 
 else:
