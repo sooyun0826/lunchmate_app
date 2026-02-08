@@ -231,7 +231,7 @@ def naver_cafe_search_cached(query: str, client_id: str, client_secret: str, dis
 # ===============================
 st.set_page_config(page_title="LunchMate 🍱", layout="wide")
 st.title("🍽️ LunchMate")
-st.caption("직장인의 상황과 선호도를 분석해 ‘실제로 존재하는’ 식당 후보 중 최적의 3곳을 추천합니다")
+st.caption("사용자님의 상황과 선호도를 바탕으로 관련된 음식점 후보 중 최적의 3곳을 추천해 드립니다")
 
 # Secrets 상태 표시
 st.sidebar.header("🔐 연결 상태")
