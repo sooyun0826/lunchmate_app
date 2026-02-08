@@ -295,7 +295,7 @@ st.set_page_config(page_title="LunchMate 🍱", layout="wide")
 
 # ✅ 문구/네이밍: 점심 한정 제거
 st.title("🍽️ LunchMate 🍽️")
-st.caption("사용자님의 상황과 선호도를 바탕으로 ‘실제 존재하는’ 후보 중 최적의 5곳을 추천해 드립니다.")
+st.caption("사용자님의 상황과 선호도를 바탕으로 음식점/카페 후보 중 최적의 5곳을 추천해 드립니다.")
 
 naver_client_id = get_secret("NAVER_CLIENT_ID")
 naver_client_secret = get_secret("NAVER_CLIENT_SECRET")
