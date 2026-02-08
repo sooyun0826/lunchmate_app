@@ -214,7 +214,6 @@ def ensure_k_recommendations(
                 "address": c.get("address", ""),
                 "category": c.get("category", ""),
                 "link": c.get("link", ""),
-                "evidence": ["네이버 지역검색 후보에 존재"],
             })
             if len(recs) == k:
                 break
@@ -312,7 +311,6 @@ st.markdown(
     unsafe_allow_html=True
 )
 
-# ✅ 문구/네이밍: 점심 한정 제거
 st.title("🍽️ LunchMate 🍽️")
 st.caption("사용자님의 상황과 선호도를 바탕으로 음식점/카페 후보 중 최적의 5곳을 추천해 드립니다.")
 
@@ -364,7 +362,6 @@ situation = st.text_area(
     placeholder="예: 오늘 친구와 신촌역 근처에서 점심 먹을거야. 분위기 좋은 중식 음식점 추천해줘. / 신촌에 카공하기 좋은 카페 가고 싶어.",
 )
 
-# ✅ 빠른 입력 버튼도 “점심” 전용 표현 제거
 col1, col2, col3, col4 = st.columns(4)
 with col1:
     if st.button("⚡ 빨리 먹기"):
@@ -480,7 +477,6 @@ def recommend_from_candidates(client: OpenAI, payload: Dict[str, Any], candidate
         "      \"name\": \"...\",\n"
         "      \"reason\": \"...\",\n"
         "      \"tags\": [\"#브런치\", \"#조용함\", \"#디저트\"],\n"
-        "      \"evidence\": [\"candidates에 존재\", \"카테고리: ...\", \"주소: ...\"],\n"
         "      \"address\": \"...\",\n"
         "      \"category\": \"...\",\n"
         "      \"link\": \"...\"\n"
@@ -604,7 +600,6 @@ if run_search or reroll:
         category = r.get("category", "") or "정보 없음"
         reason = r.get("reason", "")
         tags = r.get("tags", [])
-        evidence = r.get("evidence", [])
 
         with st.container():
             left, right = st.columns([3, 2])
@@ -622,12 +617,6 @@ if run_search or reroll:
                 st.link_button("🗺️ 네이버 지도에서 보기", naver_map_search_url(name, address))
                 if r.get("link"):
                     st.link_button("🔗 네이버/예약 링크", r["link"])
-
-            if evidence and isinstance(evidence, list):
-                with st.expander("🧾 추천 근거(요약)"):
-                    for ev in evidence[:8]:
-                        if ev:
-                            st.write(f"- {ev}")
 
             if show_reviews:
                 q = make_review_query(name, r.get("address", ""))
