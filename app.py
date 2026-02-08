@@ -1,6 +1,9 @@
+import json
+
 import streamlit as st
 import pandas as pd
 import matplotlib.pyplot as plt
+from openai import OpenAI
 
 # -------------------------------
 # 기본 설정
@@ -17,6 +20,12 @@ st.caption("직장인의 상황과 선호도를 분석해 최적의 점심 식�
 # Sidebar (검색 조건 필터)
 # -------------------------------
 st.sidebar.header("🔍 검색 조건")
+
+api_key = st.sidebar.text_input(
+    "OpenAI API Key",
+    type="password",
+    help="키를 입력하면 챗봇이 상황을 분석해 식당을 추천합니다.",
+)
 
 people = st.sidebar.slider("인원 수", 1, 10, 5)
 distance = st.sidebar.selectbox("이동 거리", ["5분 이내", "10분 이내", "상관없음"])
@@ -56,43 +65,62 @@ st.write("")
 # 추천 버튼
 # -------------------------------
 if st.button("🤖 점심 추천 받기") and situation:
+    if not api_key:
+        st.warning("사이드바에 OpenAI API Key를 입력해 주세요.")
+        st.stop()
 
-    # -------------------------------
-    # (Mock) 추천 결과
-    # -------------------------------
-    recommendations = [
-        {
-            "rank": 1,
-            "name": "정갈한 한정식",
-            "reason": "룸이 있어 5명이 조용히 식사하기 좋고 회전율이 빠릅니다",
-            "rating": 4.6,
-            "distance": 5,
-            "price": 12000
-        },
-        {
-            "rank": 2,
-            "name": "직장인 백반집",
-            "reason": "빠른 제공과 가성비로 점심시간을 효율적으로 쓸 수 있습니다",
-            "rating": 4.4,
-            "distance": 3,
-            "price": 9000
-        },
-        {
-            "rank": 3,
-            "name": "소담한 일식집",
-            "reason": "조용한 분위기와 안정적인 메뉴 구성으로 호불호가 적습니다",
-            "rating": 4.2,
-            "distance": 7,
-            "price": 13000
-        }
-    ]
+    client = OpenAI(api_key=api_key)
+    system_prompt = (
+        "너는 직장인 점심 추천 챗봇이다. "
+        "사용자의 상황과 선호 조건을 분석해 식당 3곳을 추천한다. "
+        "각 추천에는 간단한 이유와 대략적인 평점, 거리(분), 가격(원)을 포함한다. "
+        "응답은 반드시 JSON 형식으로만 출력한다."
+    )
+    user_prompt = (
+        "아래 조건을 고려해 점심 식당 3곳을 추천해 줘.\n"
+        f"- 상황: {situation}\n"
+        f"- 인원 수: {people}\n"
+        f"- 이동 거리 선호: {distance}\n"
+        f"- 음식 종류 선호: {', '.join(food_type) if food_type else '상관없음'}\n\n"
+        "출력 JSON 스키마:\n"
+        "{\n"
+        "  \"summary\": \"한 줄 결론\",\n"
+        "  \"recommendations\": [\n"
+        "    {\"rank\": 1, \"name\": \"식당명\", \"reason\": \"추천 이유\", \"rating\": 4.5, \"distance\": 5, \"price\": 12000}\n"
+        "  ]\n"
+        "}\n"
+        "추천은 반드시 3개만 포함해."
+    )
+
+    with st.spinner("AI가 식당을 추천하는 중입니다..."):
+        response = client.responses.create(
+            model="gpt-4.1-mini",
+            input=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        )
+
+    raw_output = response.output_text
+    try:
+        parsed = json.loads(raw_output)
+    except json.JSONDecodeError:
+        st.error("AI 응답을 해석하지 못했습니다. 잠시 후 다시 시도해 주세요.")
+        st.stop()
+
+    recommendations = parsed.get("recommendations", [])
+    summary = parsed.get("summary", "추천 결과를 확인해 주세요.")
+
+    if len(recommendations) != 3:
+        st.error("추천 결과가 3개가 아닙니다. 다시 시도해 주세요.")
+        st.stop()
 
     df = pd.DataFrame(recommendations)
 
     # -------------------------------
     # 한 줄 결론
     # -------------------------------
-    st.success("⏱️ **빠른 식사와 조용한 분위기가 중요하다면 1번 식당이 가장 적합합니다.**")
+    st.success(f"✅ **{summary}**")
 
     # -------------------------------
     # 추천 카드
