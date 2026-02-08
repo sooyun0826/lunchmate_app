@@ -12,30 +12,33 @@ from openai import OpenAI
 
 
 # ===============================
-# 기본 설정
+# 기본 디폴트 설정 (초기값)
 # ===============================
 DEFAULT_PEOPLE = 2
 DISTANCE_OPTIONS = ["5분 이내", "10분 이내", "상관없음"]
 DEFAULT_DISTANCE_INDEX = 2  # "상관없음"
 
+# ✅ “음식점 + 카페”까지 포함하도록 옵션 확장
 FOOD_OPTIONS = [
     "한식", "중식", "일식", "양식", "분식", "기타",
     "카페", "디저트"
 ]
 DEFAULT_FOOD_TYPES: List[str] = []
 
+# ✅ 추천 개수
 TOP_K = 5
 
 # 후보 확장 / 성능
 MAX_QUERIES = 6
 LOCAL_DISPLAY_PER_QUERY = 5
-CANDIDATE_LIMIT_FOR_LLM = 35
+CANDIDATE_LIMIT_FOR_LLM = 40
 REQUEST_SLEEP_SEC = 0.08
 
-# 스코어링/검증 튜닝
-SCORE_CANDIDATE_POOL = 60          # 스코어링에 사용할 최대 후보 수(많을수록 느림)
-BLOG_AUGMENT_TOP_M = 18            # 블로그 스니펫으로 추가 점수 줄 후보 상위 M개
-BLOG_SCORE_DISPLAY = 3             # 스코어링용 블로그 포스트 수(1~5 권장)
+# 블로그 분석용(스니펫만 사용)
+BLOG_PER_PLACE_FOR_SCORING = 3
+
+# 스코어링 이후 LLM에 넘길 후보 수
+LLM_RERANK_POOL = 25
 
 
 # ===============================
@@ -58,18 +61,30 @@ def safe_int(x: Any, default: int = 999) -> int:
         return default
 
 
-def normalize(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "").strip())
+def normalize_text(s: str) -> str:
+    s = (s or "").strip().lower()
+    s = re.sub(r"\s+", " ", s)
+    return s
 
 
-def contains_any(text: str, keywords: List[str]) -> bool:
-    t = text or ""
-    return any(k in t for k in keywords)
+def split_csv(text: str) -> List[str]:
+    parts = [p.strip() for p in (text or "").split(",")]
+    return [p for p in parts if p]
 
 
-def count_any(text: str, keywords: List[str]) -> int:
-    t = text or ""
-    return sum(1 for k in keywords if k in t)
+def any_kw(blob: str, kws: List[str]) -> bool:
+    b = normalize_text(blob)
+    return any(normalize_text(k) in b for k in kws if k)
+
+
+def count_kw_hits(blob: str, kws: List[str]) -> int:
+    b = normalize_text(blob)
+    hits = 0
+    for k in kws:
+        kk = normalize_text(k)
+        if kk and kk in b:
+            hits += 1
+    return hits
 
 
 def naver_local_search(
@@ -81,7 +96,7 @@ def naver_local_search(
     start: int = 1,
 ) -> List[Dict[str, str]]:
     """
-    네이버 지역검색 API
+    네이버 지역검색 API로 실존 장소 후보 수집
     https://openapi.naver.com/v1/search/local.json
     """
     url = "https://openapi.naver.com/v1/search/local.json"
@@ -116,7 +131,7 @@ def dedupe_candidates(candidates: List[Dict[str, str]]) -> List[Dict[str, str]]:
     seen = set()
     uniq = []
     for c in candidates:
-        key = (normalize(c.get("name", "")), normalize(c.get("address", "")))
+        key = ((c.get("name", "") or "").strip(), (c.get("address", "") or "").strip())
         if key in seen:
             continue
         seen.add(key)
@@ -126,7 +141,7 @@ def dedupe_candidates(candidates: List[Dict[str, str]]) -> List[Dict[str, str]]:
 
 def filter_candidates(candidates: List[Dict[str, str]]) -> List[Dict[str, str]]:
     """
-    명백히 비식음료 업종 제거(병원/학원/부동산 등)
+    ✅ 음식점/카페 추천 서비스 기준으로, 명백히 비식음료 업종만 제거
     """
     bad_keywords = [
         "학원", "공인중개", "부동산", "미용", "네일", "피부", "성형",
@@ -136,7 +151,9 @@ def filter_candidates(candidates: List[Dict[str, str]]) -> List[Dict[str, str]]:
     ]
     out = []
     for c in candidates:
-        blob = f"{c.get('name','')} {c.get('category','')}"
+        name = (c.get("name") or "").strip()
+        cat = (c.get("category") or "").strip()
+        blob = f"{name} {cat}"
         if any(k in blob for k in bad_keywords):
             continue
         out.append(c)
@@ -152,12 +169,13 @@ def extract_json_from_text(text: str) -> dict:
         pass
 
     text = text.replace("```json", "```").replace("```", "")
+
     start = text.find("{")
     end = text.rfind("}")
     if start == -1 or end == -1 or end <= start:
         raise json.JSONDecodeError("No JSON object found", text, 0)
 
-    candidate = text[start : end + 1]
+    candidate = text[start: end + 1]
     return json.loads(candidate)
 
 
@@ -192,8 +210,13 @@ def ensure_k_recommendations(
     candidates: List[Dict[str, str]],
     k: int,
 ) -> List[Dict[str, Any]]:
+    """
+    추천 결과가 k개 미만이면 candidates에서 부족분을 채워 k개로 맞춤
+    - 중복(이름+주소) 제거
+    - rank 1~k 재정렬
+    """
     def _key(name: str, address: str) -> tuple:
-        return (normalize(name), normalize(address))
+        return (str(name or "").strip(), str(address or "").strip())
 
     recs = [r for r in recommendations if isinstance(r, dict)]
     recs = sorted(recs, key=lambda x: safe_int(x.get("rank", 999)))
@@ -218,7 +241,7 @@ def ensure_k_recommendations(
                 "rank": len(recs) + 1,
                 "name": c.get("name", ""),
                 "reason": "후보 중 조건과 무난하게 잘 맞는 선택지입니다.",
-                "tags": ["무난", "후보기반"],
+                "tags": ["후보기반"],
                 "address": c.get("address", ""),
                 "category": c.get("category", ""),
                 "link": c.get("link", ""),
@@ -291,420 +314,179 @@ def build_cache_key(payload: Dict[str, Any]) -> str:
         "exclude": payload.get("exclude", ""),
         "prefer": payload.get("prefer", ""),
         "visit_type": payload.get("visit_type", ""),
+        "blog_sort": payload.get("blog_sort", "sim"),
     }
     return json.dumps(compact, ensure_ascii=False, sort_keys=True)
 
 
 # ===============================
-# (1) Intent 추출 (LLM)
+# “명확한 기준” 룰셋 (혼밥 강화)
 # ===============================
-INTENT_LABELS = [
-    "혼밥/1인식사",
-    "빠른 이용",
-    "모임/회식",
-    "데이트/분위기",
-    "카페/카공",
-    "해장",
-    "술자리/안주",
-    "일반",
+# 혼밥을 강하게 반영: 단체/모임 시그널을 강한 감점 또는 하드 제외로 처리
+SOLO_HARD_EXCLUDE = [
+    "웨딩", "대관", "연회", "행사", "세미나",
+    "뷔페", "돌잔치",
+]
+SOLO_STRONG_PENALTY = [
+    "단체", "단체석", "단체가능", "회식", "모임", "룸", "룸완비", "가족모임",
+    "예약필수", "대형", "연말",
+]
+SOLO_POSITIVE = [
+    "혼밥", "혼자", "1인", "1인식사", "바자리", "카운터", "키오스크",
+    "회전율", "빠르게", "포장", "테이크아웃"
 ]
 
+# 혼밥에 자주 부적합한 업종 (완전 제외는 아니지만 강한 패널티)
+SOLO_CATEGORY_PENALTY = [
+    "고기", "삼겹", "갈비", "한우", "무한리필", "바베큐", "곱창", "막창",
+    "참치", "횟집", "대게", "코스", "뷔페"
+]
 
-def infer_intent(client: OpenAI, payload: Dict[str, Any]) -> Dict[str, Any]:
+# 가성비/저렴
+BUDGET_POSITIVE = ["가성비", "저렴", "착한가격", "가성비맛집", "만원", "만원대", "점심특선", "세트", "백반"]
+BUDGET_NEGATIVE = ["오마카세", "파인다이닝", "코스", "프리미엄", "고급", "비싼", "고가"]
+
+
+def infer_intents(payload: Dict[str, Any]) -> Dict[str, bool]:
     """
-    사용자의 상황을 구조적 기준으로 변환(모델 출력은 '판정'에 사용, 최종 강제는 룰/스코어가 담당)
+    사용자의 입력(상황/인원/선호/제외/visit_type)에서 intent를 간단히 추론.
+    - 혼밥: people==1 이거나 situation에 혼밥/혼자/1인
+    - 가성비: situation/prefer에 가성비/저렴
     """
-    system = (
-        "너는 음식점/카페 추천을 위한 '의도(intent) 판정기'다.\n"
-        "출력은 JSON만.\n"
-        "스키마:\n"
-        "{\n"
-        "  \"intent\": \"혼밥/1인식사|빠른 이용|모임/회식|데이트/분위기|카페/카공|해장|술자리/안주|일반\",\n"
-        "  \"must_include\": [\"...\"] ,\n"
-        "  \"must_exclude\": [\"...\"] ,\n"
-        "  \"notes\": \"판정 근거 한 줄\"\n"
-        "}\n"
-        "- must_include/must_exclude는 업종/키워드 중심으로 짧게.\n"
-        "- 모르면 intent는 '일반'으로.\n"
-        "- 숫자/사실을 지어내지 마라."
-    )
+    situation = payload.get("situation", "")
+    prefer = payload.get("prefer", "")
+    people = payload.get("people", 0)
 
-    food = payload.get("food_type") or []
-    food_str = ", ".join(food) if food else "(선택 없음)"
-
-    user = (
-        f"visit_type(시간대/종류): {payload.get('visit_type')}\n"
-        f"출발지: {payload.get('start_location') or '(미입력)'}\n"
-        f"상황: {payload.get('situation')}\n"
-        f"인원: {payload.get('people')}\n"
-        f"이동거리: {payload.get('distance_pref')}\n"
-        f"선호 종류: {food_str}\n"
-        f"제외: {payload.get('exclude') or '(없음)'}\n"
-        f"선호: {payload.get('prefer') or '(없음)'}\n\n"
-        f"가능한 intent 라벨: {', '.join(INTENT_LABELS)}"
-    )
-
-    data = llm_json(client, system, user)
-    intent = data.get("intent", "일반")
-    if intent not in INTENT_LABELS:
-        intent = "일반"
-    must_in = data.get("must_include", [])
-    must_ex = data.get("must_exclude", [])
-    if not isinstance(must_in, list):
-        must_in = []
-    if not isinstance(must_ex, list):
-        must_ex = []
-    return {
-        "intent": intent,
-        "must_include": [normalize(str(x)) for x in must_in if normalize(str(x))],
-        "must_exclude": [normalize(str(x)) for x in must_ex if normalize(str(x))],
-        "notes": normalize(str(data.get("notes", ""))),
-    }
+    blob = f"{situation} {prefer}".strip()
+    solo = (people == 1) or any_kw(blob, ["혼밥", "혼자", "1인", "1인식사", "혼술"])
+    budget = any_kw(blob, ["가성비", "저렴", "싸게", "착한가격", "만원", "만원대"])
+    return {"solo": solo, "budget": budget}
 
 
-# ===============================
-# (2) Intent별 룰/스코어 함수
-# ===============================
-RULES = {
-    "혼밥/1인식사": {
-        "hard_exclude": ["무한리필", "단체", "연회", "웨딩", "대관", "뷔페"],
-        "penalty": {
-            "고기": -50, "구이": -50, "삼겹": -50, "갈비": -50, "양꼬치": -45,
-            "주점": -60, "술집": -60, "호프": -60, "포차": -60, "바": -45,
-        },
-        "bonus": {
-            "국밥": +25, "라멘": +25, "우동": +20, "덮밥": +20, "백반": +20,
-            "분식": +18, "김밥": +18, "샐러드": +18, "버거": +15, "쌀국수": +18,
-            "초밥": +12, "돈까스": +12, "제육": +10,
-        },
-        "blog_bonus_keywords": ["혼밥", "혼자", "1인", "점심", "런치", "점심특선", "회전율", "빠르게"],
-    },
-    "빠른 이용": {
-        "hard_exclude": ["코스", "오마카세", "뷔페", "대관"],
-        "penalty": {"웨이팅": -20, "주점": -30, "포차": -30, "바": -20},
-        "bonus": {"분식": +20, "김밥": +18, "국밥": +18, "라멘": +15, "버거": +15, "샐러드": +12},
-        "blog_bonus_keywords": ["회전율", "빨리", "금방", "대기", "포장", "키오스크"],
-    },
-    "모임/회식": {
-        "hard_exclude": ["1인", "혼밥"],
-        "penalty": {"카공": -10},
-        "bonus": {"단체": +18, "룸": +18, "고기": +12, "구이": +12, "전골": +10, "한정식": +12},
-        "blog_bonus_keywords": ["룸", "단체", "회식", "모임", "예약", "넓", "단체석"],
-    },
-    "데이트/분위기": {
-        "hard_exclude": ["셀프", "푸드코트"],
-        "penalty": {"분식": -8, "패스트푸드": -8},
-        "bonus": {"와인": +12, "파스타": +12, "브런치": +10, "디저트": +10, "카페": +8},
-        "blog_bonus_keywords": ["분위기", "데이트", "감성", "조명", "인테리어", "사진", "뷰"],
-    },
-    "카페/카공": {
-        "hard_exclude": ["주점", "호프", "포차", "고기", "구이"],
-        "penalty": {"식당": -5},
-        "bonus": {"카페": +30, "디저트": +20, "베이커리": +18, "커피": +15},
-        "blog_bonus_keywords": ["카공", "노트북", "콘센트", "조용", "좌석", "공부", "와이파이", "디저트"],
-    },
-    "해장": {
-        "hard_exclude": ["디저트", "케이크"],
-        "penalty": {"카페": -10},
-        "bonus": {"국밥": +25, "해장": +20, "순대": +15, "감자탕": +18, "칼국수": +15, "라멘": +10},
-        "blog_bonus_keywords": ["해장", "국물", "시원", "얼큰", "속풀이"],
-    },
-    "술자리/안주": {
-        "hard_exclude": ["키즈", "학원"],
-        "penalty": {"샐러드": -8},
-        "bonus": {"주점": +25, "술집": +25, "호프": +20, "포차": +20, "바": +15, "안주": +12},
-        "blog_bonus_keywords": ["안주", "분위기", "술", "2차", "맥주", "하이볼", "와인"],
-    },
-    "일반": {
-        "hard_exclude": [],
-        "penalty": {},
-        "bonus": {},
-        "blog_bonus_keywords": [],
-    },
-}
+def candidate_signal_blob(candidate: Dict[str, str], blog_snippets: List[str]) -> str:
+    name = candidate.get("name", "") or ""
+    category = candidate.get("category", "") or ""
+    addr = candidate.get("address", "") or ""
+    blog = " ".join(blog_snippets[:10])
+    return f"{name} {category} {addr} {blog}".strip()
 
 
-def score_candidate(
-    c: Dict[str, str],
-    intent: str,
-    extra_must_exclude: List[str],
-) -> Tuple[int, List[str]]:
+def score_candidate_for_payload(
+    payload: Dict[str, Any],
+    candidate: Dict[str, str],
+    blog_snippets: List[str],
+    intents: Dict[str, bool],
+) -> Tuple[int, Dict[str, Any]]:
     """
-    후보 1개를 (룰 기반) 점수화. 점수+간단한 사유 로그 반환.
+    점수는 “참고용” (LLM에게 숫자로 근거 제시하지 않게 하되, 후보 풀 정렬에 사용)
     """
-    rule = RULES.get(intent, RULES["일반"])
-    name = normalize(c.get("name", ""))
-    cat = normalize(c.get("category", ""))
-    blob = f"{name} {cat}"
-
     score = 0
     reasons = []
 
-    # hard exclude
-    hard_ex = rule.get("hard_exclude", []) + (extra_must_exclude or [])
-    if hard_ex and contains_any(blob, hard_ex):
-        return -10_000, ["하드 제외 키워드 매칭"]
+    blob = candidate_signal_blob(candidate, blog_snippets)
+    name_cat = f"{candidate.get('name','')} {candidate.get('category','')}".strip()
 
-    # penalty/bonus
-    for k, v in (rule.get("penalty", {}) or {}).items():
-        if k in blob:
-            score += int(v)
-            reasons.append(f"패널티:{k}{v}")
+    # 0) 사용자 제외 키워드
+    exclude_terms = split_csv(payload.get("exclude", ""))
+    if exclude_terms and any_kw(blob, exclude_terms):
+        score -= 120
+        reasons.append(f"제외조건 매칭(-120): {', '.join(exclude_terms)}")
 
-    for k, v in (rule.get("bonus", {}) or {}).items():
-        if k in blob:
-            score += int(v)
-            reasons.append(f"보너스:{k}+{v}")
+    # 1) 혼밥 intent 강화
+    if intents.get("solo"):
+        if any_kw(blob, SOLO_HARD_EXCLUDE):
+            score -= 999  # 사실상 탈락
+            reasons.append("혼밥: 하드 제외 업종/용도(-999)")
+        # 단체/모임 시그널 강한 감점
+        hits = count_kw_hits(blob, SOLO_STRONG_PENALTY)
+        if hits:
+            penalty = min(80 * hits, 240)  # 최대 -240
+            score -= penalty
+            reasons.append(f"혼밥: 단체/모임 시그널({hits}) 감점(-{penalty})")
 
-    # category 기반 약한 가점: 카페/디저트 선택했는데 관련 업종이면 가점
-    if "카페" in blob:
-        score += 6
-    if "디저트" in blob or "베이커리" in blob:
-        score += 4
+        # 혼밥 긍정 시그널 가점
+        pos_hits = count_kw_hits(blob, SOLO_POSITIVE)
+        if pos_hits:
+            bonus = min(50 * pos_hits, 150)
+            score += bonus
+            reasons.append(f"혼밥: 1인 친화 시그널({pos_hits}) 가점(+{bonus})")
 
-    return score, reasons
+        # 업종 패널티(고기/무한리필/코스 등)
+        cat_hits = count_kw_hits(name_cat, SOLO_CATEGORY_PENALTY)
+        if cat_hits:
+            penalty = min(70 * cat_hits, 210)
+            score -= penalty
+            reasons.append(f"혼밥: 업종 패널티({cat_hits}) (-{penalty})")
 
+    # 2) 가성비 intent
+    if intents.get("budget"):
+        pos = count_kw_hits(blob, BUDGET_POSITIVE)
+        if pos:
+            bonus = min(35 * pos, 140)
+            score += bonus
+            reasons.append(f"가성비: 긍정 시그널({pos}) (+{bonus})")
+        neg = count_kw_hits(blob, BUDGET_NEGATIVE)
+        if neg:
+            penalty = min(60 * neg, 180)
+            score -= penalty
+            reasons.append(f"가성비: 고가 시그널({neg}) (-{penalty})")
 
-def augment_score_with_blog_snippet(
-    c: Dict[str, str],
-    base_score: int,
-    intent: str,
-    naver_client_id: str,
-    naver_client_secret: str,
-    sort_param: str,
-) -> Tuple[int, List[str]]:
-    """
-    블로그 스니펫(desc) 키워드 기반 가점
-    - 호출 비용이 있으므로 상위 일부 후보에만 적용하도록 바깥에서 제어
-    """
-    rule = RULES.get(intent, RULES["일반"])
-    kws = rule.get("blog_bonus_keywords", []) or []
-    if not kws:
-        return base_score, []
+    # 3) food_type(사용자 선택) 반영 (약하게)
+    food_types = payload.get("food_type") or []
+    if food_types:
+        # category에 직접 포함되면 가점
+        if any_kw(candidate.get("category", ""), food_types) or any_kw(candidate.get("name", ""), food_types):
+            score += 35
+            reasons.append("선택한 음식/카페 종류와 카테고리/이름 매칭(+35)")
 
-    q = make_review_query(c.get("name", ""), c.get("address", ""))
-    try:
-        posts = naver_blog_search_cached(
-            q,
-            naver_client_id,
-            naver_client_secret,
-            display=BLOG_SCORE_DISPLAY,
-            sort=sort_param,
-        )
-    except Exception:
-        return base_score, ["블로그 조회 실패(스코어 반영X)"]
-
-    blob = " ".join([normalize(p.get("desc", "")) for p in posts if isinstance(p, dict)])
-    hit = count_any(blob, kws)
-
-    # 가점은 너무 세면 편향되므로 완만하게
-    bonus = min(30, hit * 6)  # 키워드 1개당 +6, 최대 +30
-    if bonus > 0:
-        return base_score + bonus, [f"블로그키워드매칭 {hit}개(+{bonus})"]
-    return base_score, []
-
-
-def rank_candidates_with_rules(
-    candidates: List[Dict[str, str]],
-    intent_pack: Dict[str, Any],
-    naver_client_id: str,
-    naver_client_secret: str,
-    blog_sort_param: str,
-) -> List[Dict[str, Any]]:
-    """
-    (a) 룰 기반 1차 스코어링
-    (b) 상위 일부만 블로그 스니펫으로 추가 가점
-    (c) 최종 정렬 후 반환(원본 필드 + score 포함)
-    """
-    intent = intent_pack.get("intent", "일반")
-    extra_ex = intent_pack.get("must_exclude", []) or []
-
-    pool = candidates[:SCORE_CANDIDATE_POOL]
-
-    scored = []
-    for c in pool:
-        s, logs = score_candidate(c, intent=intent, extra_must_exclude=extra_ex)
-        scored.append({**c, "score": s, "_logs": logs})
-
-    scored.sort(key=lambda x: safe_int(x.get("score", -999999), -999999), reverse=True)
-
-    # 블로그 스니펫 가점(상위 M개만)
-    top_m = scored[:min(BLOG_AUGMENT_TOP_M, len(scored))]
-    rest = scored[min(BLOG_AUGMENT_TOP_M, len(scored)):]
-    boosted = []
-
-    for item in top_m:
-        s0 = safe_int(item.get("score", 0), 0)
-        s1, b_logs = augment_score_with_blog_snippet(
-            item, s0, intent=intent,
-            naver_client_id=naver_client_id,
-            naver_client_secret=naver_client_secret,
-            sort_param=blog_sort_param,
-        )
-        item["score"] = s1
-        item["_logs"] = (item.get("_logs", []) or []) + b_logs
-        boosted.append(item)
-
-    boosted.sort(key=lambda x: safe_int(x.get("score", -999999), -999999), reverse=True)
-    final_scored = boosted + rest
-    final_scored.sort(key=lambda x: safe_int(x.get("score", -999999), -999999), reverse=True)
-    return final_scored
-
-
-# ===============================
-# (3) 스코어 상위 후보만 LLM에 넘겨 추천
-# ===============================
-def generate_queries(client: OpenAI, payload: Dict[str, Any]) -> List[str]:
-    system_query = (
-        "너는 네이버 지역검색 API에 넣을 '검색어(queries)'를 생성하는 도우미다.\n"
-        "- 장소 이름을 절대 만들어내지 마라.\n"
-        "- 반드시 사용자의 출발지(지역/역/주소) 정보를 queries에 반영하라.\n"
-        "- 추천 받을 종류(아침/점심/저녁/카페) 정보를 반영하라.\n"
-        "- 검색에 잘 걸리는 짧은 키워드 조합으로.\n"
-        "- 출력은 JSON만. 스키마: { \"queries\": [\"...\", \"...\"] }\n"
-        "- queries는 3~6개."
-    )
-
-    food = payload.get("food_type") or []
-    food_str = ", ".join(food) if food else "(선택 없음)"
-
+    # 4) visit_type 반영 (약하게)
     visit = payload.get("visit_type", "상관없음")
-    visit_hint = {
-        "아침": "아침/브런치",
-        "점심": "점심 맛집",
-        "저녁": "저녁/술자리",
-        "카페/디저트": "카페/디저트",
-        "상관없음": "맛집/카페",
-    }.get(visit, "맛집/카페")
+    if visit == "카페/디저트":
+        if any_kw(blob, ["카페", "디저트", "베이커리", "커피"]):
+            score += 40
+            reasons.append("방문목적(카페/디저트) 매칭(+40)")
+        else:
+            score -= 20
+            reasons.append("방문목적(카페/디저트) 불일치(-20)")
+    elif visit in ["아침", "점심", "저녁"]:
+        # 너무 강하게 하면 오탐 많아서 약하게만
+        if any_kw(blob, ["브런치", "아침"]):
+            score += 15 if visit == "아침" else 0
+        if any_kw(blob, ["점심특선", "런치"]):
+            score += 15 if visit == "점심" else 0
+        if any_kw(blob, ["술", "안주", "호프", "포차"]):
+            score += 15 if visit == "저녁" else 0
 
-    user_query = (
-        f"추천 종류: {visit} ({visit_hint})\n"
-        f"출발지: {payload.get('start_location') or '(미입력)'}\n"
-        f"상황: {payload.get('situation')}\n"
-        f"인원: {payload.get('people')}\n"
-        f"이동거리 선호: {payload.get('distance_pref')}\n"
-        f"선호 음식/카페 종류: {food_str}\n"
-        f"제외 조건: {payload.get('exclude') or '(없음)'}\n"
-        f"선호 조건: {payload.get('prefer') or '(없음)'}\n\n"
-        "네이버 지역검색에 넣을 queries 3~6개를 만들어줘."
-    )
+    # 5) 기본적으로 “네이버 지역검색 후보”라는 신뢰 가점(고정)
+    score += 10
 
-    q_data = llm_json(client, system_query, user_query)
-    queries = q_data.get("queries", [])
-    queries = [q.strip() for q in queries if isinstance(q, str) and q.strip()]
-
-    # 출발지 강제 포함(가능하면)
-    start = (payload.get("start_location") or "").strip()
-    if start:
-        patched = []
-        for q in queries:
-            patched.append(q if start in q else f"{start} {q}".strip())
-        queries = patched
-
-    # 중복 제거
-    uniq = []
-    seen = set()
-    for q in queries:
-        if q in seen:
-            continue
-        seen.add(q)
-        uniq.append(q)
-    return uniq[:MAX_QUERIES]
-
-
-def collect_candidates(
-    queries: List[str],
-    naver_client_id: str,
-    naver_client_secret: str,
-) -> List[Dict[str, str]]:
-    candidates: List[Dict[str, str]] = []
-    for q in queries[:MAX_QUERIES]:
-        candidates.extend(
-            naver_local_search(
-                query=q,
-                client_id=naver_client_id,
-                client_secret=naver_client_secret,
-                display=LOCAL_DISPLAY_PER_QUERY,
-                sort="comment",
-                start=1,
-            )
-        )
-        time.sleep(REQUEST_SLEEP_SEC)
-
-    candidates = dedupe_candidates(candidates)
-    candidates = filter_candidates(candidates)
-    return candidates
-
-
-def recommend_from_candidates(
-    client: OpenAI,
-    payload: Dict[str, Any],
-    intent_pack: Dict[str, Any],
-    ranked_candidates: List[Dict[str, Any]],
-    top_k: int,
-) -> Dict[str, Any]:
-    """
-    스코어 상위 후보만 LLM에 넘겨 최종 선정
-    """
-    intent = intent_pack.get("intent", "일반")
-    must_ex = intent_pack.get("must_exclude", []) or []
-    must_in = intent_pack.get("must_include", []) or []
-
-    system_rec = (
-        "너는 음식점/카페 추천 큐레이터다.\n"
-        "- 반드시 candidates 목록에 있는 장소만 추천할 수 있다.\n"
-        "- candidates에 없는 장소를 새로 만들면 실패다.\n"
-        "- 사용자의 intent(의도)와 MUST 조건을 우선으로 지켜라.\n"
-        "- MUST_EXCLUDE 조건에 걸리는 장소는 추천하지 마라.\n"
-        "- 숫자(평점/가격/거리/시간)는 근거 데이터가 없으면 절대 지어내지 마라.\n"
-        "- 출력은 JSON만.\n"
-        "스키마:\n"
-        "{\n"
-        "  \"summary\": \"한 줄 결론(숫자/개수 언급 금지)\",\n"
-        "  \"recommendations\": [\n"
-        "    {\n"
-        "      \"rank\": 1,\n"
-        "      \"name\": \"...\",\n"
-        "      \"reason\": \"사용자 의도에 맞는 이유(짧고 명확)\",\n"
-        "      \"tags\": [\"#키워드\", \"#키워드\"],\n"
-        "      \"address\": \"...\",\n"
-        "      \"category\": \"...\",\n"
-        "      \"link\": \"...\"\n"
-        "    }\n"
-        "  ]\n"
-        "}\n"
-        f"- recommendations는 가능한 한 정확히 {top_k}개를 채워라.\n"
-        "- rank는 1부터 연속.\n"
-        "- summary에는 '3곳/5곳' 같은 개수 표현을 쓰지 마라."
-    )
-
-    llm_candidates = []
-    for c in ranked_candidates[:CANDIDATE_LIMIT_FOR_LLM]:
-        llm_candidates.append({
-            "name": c.get("name", ""),
-            "address": c.get("address", ""),
-            "category": c.get("category", ""),
-            "link": c.get("link", ""),
-            "score_hint": c.get("score", 0),  # 참고용(모델이 숫자 근거로 쓰지 않게)
-        })
-
-    llm_payload = {
-        "intent": intent,
-        "must_include": must_in,
-        "must_exclude": must_ex,
-        "visit_type": payload.get("visit_type", "상관없음"),
-        "start_location": payload.get("start_location", ""),
-        "situation": payload.get("situation", ""),
-        "people": payload.get("people", 0),
-        "distance_pref": payload.get("distance_pref", ""),
-        "food_type": payload.get("food_type", []),
-        "exclude": payload.get("exclude", ""),
-        "prefer": payload.get("prefer", ""),
-        "top_k": top_k,
-        "candidates": llm_candidates,
+    meta = {
+        "score": score,
+        "score_notes": reasons[:8],  # 디버깅/개발용(화면에는 숨김 가능)
     }
-    user_rec = json.dumps(llm_payload, ensure_ascii=False)
-    return llm_json(client, system_rec, user_rec)
+    return score, meta
+
+
+def solo_gate_filter(sorted_candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    혼밥 intent에서 “단체 시그널 강한 후보”를 상위에서 제거하는 게이트.
+    - 너무 엄격하면 후보가 사라질 수 있으니, 일정량은 남기고 완화
+    """
+    kept = []
+    dropped = []
+    for c in sorted_candidates:
+        blob = normalize_text(c.get("_signal_blob", ""))
+        # 단체/모임 키워드가 강하게 묻어나면 제외
+        if any(k in blob for k in [normalize_text(x) for x in SOLO_STRONG_PENALTY]):
+            dropped.append(c)
+        else:
+            kept.append(c)
+    # 최소 15개는 유지 (후보가 너무 적으면 완화)
+    if len(kept) >= 15:
+        return kept
+    # 부족하면 dropped 중 점수 높은 순으로 보충
+    dropped = sorted(dropped, key=lambda x: safe_int(x.get("_score", -999999)), reverse=True)
+    return kept + dropped[: max(0, 15 - len(kept))]
 
 
 # ===============================
@@ -712,7 +494,7 @@ def recommend_from_candidates(
 # ===============================
 st.set_page_config(page_title="LunchMate 🍱", layout="wide")
 
-# 스크롤 잠김 방지 CSS
+# ✅ 스크롤 잠김 방지 CSS
 st.markdown(
     """
     <style>
@@ -727,6 +509,7 @@ st.markdown(
 st.title("🍽️ LunchMate 🍽️")
 st.caption(f"사용자님의 상황과 선호도를 바탕으로 음식점/카페 후보 중 최적의 {TOP_K}곳을 추천해 드립니다.")
 
+# ✅ Secrets 로드 (사이드바 '연결 상태' UI는 없음)
 naver_client_id = get_secret("NAVER_CLIENT_ID")
 naver_client_secret = get_secret("NAVER_CLIENT_SECRET")
 openai_api_key = get_secret("OPENAI_API_KEY")
@@ -735,17 +518,6 @@ if "candidate_cache_key" not in st.session_state:
     st.session_state["candidate_cache_key"] = None
 if "candidates" not in st.session_state:
     st.session_state["candidates"] = []
-if "ranked_candidates" not in st.session_state:
-    st.session_state["ranked_candidates"] = []
-if "intent_pack" not in st.session_state:
-    st.session_state["intent_pack"] = None
-
-
-def require_secrets_or_stop():
-    if not (naver_client_id and naver_client_secret and openai_api_key):
-        st.error("서비스 설정 오류가 발생했습니다. 잠시 후 다시 시도해 주세요.")
-        st.stop()
-
 
 # ===============================
 # 사이드바
@@ -767,7 +539,7 @@ food_type = st.sidebar.multiselect("음식/카페 종류", FOOD_OPTIONS, default
 
 st.sidebar.header("🚫 제외 / ✅ 선호")
 exclude_text = st.sidebar.text_input("제외 조건(쉼표로 구분)", placeholder="예: 매운 음식, 회, 웨이팅")
-prefer_text = st.sidebar.text_input("선호 조건(쉼표로 구분)", placeholder="예: 혼밥, 조용한 곳, 가성비, 디저트")
+prefer_text = st.sidebar.text_input("선호 조건(쉼표로 구분)", placeholder="예: 조용한 곳, 가성비, 디저트")
 
 st.sidebar.header("🖼️ 후기/사진 설정")
 show_reviews = st.sidebar.checkbox("블로그 후기 표시", value=True)
@@ -775,6 +547,9 @@ review_display = st.sidebar.slider("장소당 블로그 후기 개수", 1, 3, 2)
 blog_sort = st.sidebar.radio("후기 정렬", ["연관도(추천)", "최신순"], index=0)
 blog_sort_param = "sim" if blog_sort.startswith("연관도") else "date"
 
+# (개발/디버깅 옵션)
+st.sidebar.divider()
+debug_mode = st.sidebar.checkbox("🧪 디버그(후보 점수/필터 보기)", value=False)
 
 # ===============================
 # 메인 입력
@@ -782,7 +557,7 @@ blog_sort_param = "sim" if blog_sort.startswith("연관도") else "date"
 st.subheader("📝 희망 조건을 자유롭게 입력해 주세요")
 situation = st.text_area(
     "자연스럽게 입력해 주세요(취향, 방문 지역, 방문자 수, 상황 등)",
-    placeholder="예: 점심에 혼밥하기 좋은 곳 / 회식하기 좋은 고깃집 / 카공 가능한 조용한 카페 등",
+    placeholder="예: 별내동 점심에 혼자 가기 좋은 가성비 맛집 추천해줘. / 을지로에서 분위기 좋은 술집 찾고 있어.",
 )
 
 col1, col2, col3, col4 = st.columns(4)
@@ -797,11 +572,212 @@ with col3:
         situation = "어제 술을 마셔서 해장에 좋은 음식을 먹고 싶어요"
 with col4:
     if st.button("☕ 카페"):
-        situation = "카공하기 좋고 콘센트/좌석이 괜찮은 카페를 찾고 있어요"
+        situation = "디저트/커피가 괜찮고 사진 찍기 좋은 카페를 찾고 있어요"
 
 st.write("")
 
-# 버튼(재추천)
+
+def require_secrets_or_stop():
+    if not (naver_client_id and naver_client_secret and openai_api_key):
+        st.error("서비스 설정 오류가 발생했습니다. 잠시 후 다시 시도해 주세요.")
+        st.stop()
+
+
+def generate_queries(client: OpenAI, payload: Dict[str, Any]) -> List[str]:
+    system_query = (
+        "너는 네이버 지역검색 API에 넣을 '검색어(queries)'를 생성하는 도우미다.\n"
+        "- 장소 이름을 절대 만들어내지 마라.\n"
+        "- 반드시 사용자의 출발지(지역/역/주소) 정보를 queries에 반영하라.\n"
+        "- 추천 받을 종류(아침/점심/저녁/카페) 정보를 반영하라.\n"
+        "- 검색에 잘 걸리는 짧은 키워드 조합으로.\n"
+        "- 출력은 JSON만. 스키마: { \"queries\": [\"...\", \"...\"] }\n"
+        "- queries는 3~6개."
+    )
+
+    food = payload.get("food_type") or []
+    food_str = ", ".join(food) if food else "(선택 없음)"
+
+    visit = payload.get("visit_type", "상관없음")
+    visit_hint = {
+        "아침": "아침/브런치",
+        "점심": "점심",
+        "저녁": "저녁/술자리",
+        "카페/디저트": "카페/디저트",
+        "상관없음": "맛집/카페",
+    }.get(visit, "맛집/카페")
+
+    user_query = (
+        f"추천 종류: {visit} ({visit_hint})\n"
+        f"출발지: {payload.get('start_location') or '(미입력)'}\n"
+        f"상황: {payload.get('situation')}\n"
+        f"인원: {payload.get('people')}\n"
+        f"이동거리 선호: {payload.get('distance_pref')}\n"
+        f"선호 음식/카페 종류: {food_str}\n"
+        f"제외 조건: {payload.get('exclude') or '(없음)'}\n"
+        f"선호 조건: {payload.get('prefer') or '(없음)'}\n\n"
+        "네이버 지역검색에 넣을 queries 3~6개를 만들어줘."
+    )
+
+    q_data = llm_json(client, system_query, user_query)
+    queries = q_data.get("queries", [])
+    queries = [q.strip() for q in queries if isinstance(q, str) and q.strip()]
+
+    start = (payload.get("start_location") or "").strip()
+    if start:
+        patched = []
+        for q in queries:
+            patched.append(q if start in q else f"{start} {q}".strip())
+        queries = patched
+
+    uniq = []
+    seen = set()
+    for q in queries:
+        if q in seen:
+            continue
+        seen.add(q)
+        uniq.append(q)
+    return uniq[:MAX_QUERIES]
+
+
+def collect_candidates(queries: List[str]) -> List[Dict[str, str]]:
+    candidates: List[Dict[str, str]] = []
+    for q in queries[:MAX_QUERIES]:
+        candidates.extend(
+            naver_local_search(
+                query=q,
+                client_id=naver_client_id,
+                client_secret=naver_client_secret,
+                display=LOCAL_DISPLAY_PER_QUERY,
+                sort="comment",
+                start=1,
+            )
+        )
+        time.sleep(REQUEST_SLEEP_SEC)
+
+    candidates = dedupe_candidates(candidates)
+    candidates = filter_candidates(candidates)
+    return candidates
+
+
+def score_and_prepare_candidates(
+    payload: Dict[str, Any],
+    candidates: List[Dict[str, str]],
+    blog_sort_param: str,
+) -> List[Dict[str, Any]]:
+    intents = infer_intents(payload)
+
+    enriched: List[Dict[str, Any]] = []
+    for c in candidates:
+        name = c.get("name", "")
+        addr = c.get("address", "")
+        q = make_review_query(name, addr)
+
+        # 블로그 스니펫 가져와서 “혼밥/단체” 시그널에 활용
+        try:
+            posts = naver_blog_search_cached(
+                q, naver_client_id, naver_client_secret,
+                display=BLOG_PER_PLACE_FOR_SCORING,
+                sort=blog_sort_param,
+            )
+            snippets = []
+            for p in posts[:BLOG_PER_PLACE_FOR_SCORING]:
+                snippets.append(f"{p.get('title','')} {p.get('desc','')}".strip())
+        except Exception:
+            snippets = []
+
+        score, meta = score_candidate_for_payload(payload, c, snippets, intents)
+        signal_blob = candidate_signal_blob(c, snippets)
+
+        c2 = dict(c)
+        c2["_score"] = score
+        c2["_score_notes"] = meta.get("score_notes", [])
+        c2["_signal_blob"] = signal_blob
+        enriched.append(c2)
+
+    enriched = sorted(enriched, key=lambda x: safe_int(x.get("_score", -999999)), reverse=True)
+
+    # 혼밥 intent이면, 단체 시그널 강한 후보를 상위에서 게이트로 제거
+    if intents.get("solo"):
+        enriched = solo_gate_filter(enriched)
+
+    return enriched
+
+
+def recommend_from_candidates(
+    client: OpenAI,
+    payload: Dict[str, Any],
+    candidates_for_llm: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """
+    ✅ 핵심: LLM은 ‘최종 문장 생성’이 아니라 “후보 중 선택 + 설명”만.
+    ✅ 혼밥/가성비 intent를 시스템 프롬프트에 더 강하게 명시.
+    """
+    intents = infer_intents(payload)
+    must_notes = []
+    if intents.get("solo"):
+        must_notes.append("- 사용자가 혼밥/1인식사를 원한다. 단체/회식/모임 중심 장소는 우선 배제하라.")
+        must_notes.append("- 바자리/카운터/1인식사 키워드가 있거나 혼자 먹기 편한 형태를 우선하라.")
+    if intents.get("budget"):
+        must_notes.append("- 사용자가 가성비/저렴을 원한다. '오마카세/파인다이닝/고급/코스' 느낌은 배제하라.")
+
+    must_notes_text = "\n".join(must_notes) if must_notes else "- 사용자 조건에 가장 부합하는 후보를 우선하라."
+
+    system_rec = (
+        "너는 음식점/카페 추천 큐레이터다.\n"
+        "- 반드시 candidates 목록에 있는 장소만 추천할 수 있다.\n"
+        "- candidates에 없는 장소를 새로 만들면 실패다.\n"
+        "- 숫자(평점/가격/거리/시간)는 근거 데이터가 없으면 절대 지어내지 마라.\n"
+        "- 출력은 JSON만.\n"
+        f"{must_notes_text}\n"
+        "스키마:\n"
+        "{\n"
+        "  \"recommendations\": [\n"
+        "    {\n"
+        "      \"rank\": 1,\n"
+        "      \"name\": \"...\",\n"
+        "      \"reason\": \"...\",\n"
+        "      \"tags\": [\"#가성비\", \"#혼밥\", \"#조용함\"],\n"
+        "      \"address\": \"...\",\n"
+        "      \"category\": \"...\",\n"
+        "      \"link\": \"...\"\n"
+        "    }\n"
+        "  ]\n"
+        "}\n"
+        f"- recommendations는 반드시 정확히 {TOP_K}개를 출력하라.\n"
+        "- rank는 1부터 연속이어야 한다.\n"
+        "- tags는 짧게 2~5개."
+    )
+
+    # LLM에게 점수는 숨기고(유도 방지), 필수 필드와 시그널 요약만 제공
+    slim_candidates = []
+    for c in candidates_for_llm[:CANDIDATE_LIMIT_FOR_LLM]:
+        slim_candidates.append({
+            "name": c.get("name", ""),
+            "address": c.get("address", ""),
+            "category": c.get("category", ""),
+            "link": c.get("link", ""),
+            "signal": " ".join((c.get("_score_notes") or [])[:3]),  # 사람 읽기용 힌트(점수 자체는 제외)
+        })
+
+    llm_payload = {
+        "visit_type": payload.get("visit_type", "상관없음"),
+        "start_location": payload.get("start_location", ""),
+        "situation": payload.get("situation", ""),
+        "people": payload.get("people", 0),
+        "distance_pref": payload.get("distance_pref", ""),
+        "food_type": payload.get("food_type", []),
+        "exclude": payload.get("exclude", ""),
+        "prefer": payload.get("prefer", ""),
+        "top_k": TOP_K,
+        "candidates": slim_candidates,
+    }
+    user_rec = json.dumps(llm_payload, ensure_ascii=False)
+    return llm_json(client, system_rec, user_rec)
+
+
+# ===============================
+# 버튼 (UX: 재추천)
+# ===============================
 btn1, btn2 = st.columns([1, 1])
 with btn1:
     run_search = st.button("🤖 추천 받기", use_container_width=True)
@@ -813,7 +789,7 @@ with btn2:
 # 실행
 # ===============================
 if run_search or reroll:
-    if not situation:
+    if not situation.strip():
         st.warning("상황을 입력해 주세요.")
         st.stop()
 
@@ -829,22 +805,14 @@ if run_search or reroll:
         "food_type": food_type,
         "exclude": exclude_text.strip(),
         "prefer": prefer_text.strip(),
+        "blog_sort": blog_sort_param,
     }
     cache_key = build_cache_key(payload)
 
-    # reroll: 후보/스코어 재사용(의도는 다시 뽑아도 되지만, 기준 고정이 더 나아서 그대로 재사용)
+    # 1) 후보 수집(캐시)
     if reroll and st.session_state.get("candidates") and st.session_state.get("candidate_cache_key") == cache_key:
         candidates = st.session_state["candidates"]
-        ranked_candidates = st.session_state.get("ranked_candidates", [])
-        intent_pack = st.session_state.get("intent_pack") or {"intent": "일반", "must_include": [], "must_exclude": [], "notes": ""}
     else:
-        with st.spinner("의도/기준을 정리하는 중..."):
-            try:
-                intent_pack = infer_intent(client, payload)
-            except Exception:
-                # 의도 추출이 실패해도 서비스는 계속 동작하게(보수적으로 '일반')
-                intent_pack = {"intent": "일반", "must_include": [], "must_exclude": [], "notes": ""}
-
         with st.spinner("조건을 분석 중..."):
             try:
                 queries = generate_queries(client, payload)
@@ -858,7 +826,7 @@ if run_search or reroll:
 
         with st.spinner("주변 실제 후보(음식점/카페)를 찾는 중..."):
             try:
-                candidates = collect_candidates(queries, naver_client_id, naver_client_secret)
+                candidates = collect_candidates(queries)
             except requests.HTTPError as e:
                 st.error(f"네이버 지역검색 API 호출 실패(HTTP): {e}")
                 st.stop()
@@ -870,52 +838,49 @@ if run_search or reroll:
             st.warning("조건에 맞는 실제 후보를 찾지 못했어요. 키워드를 넓혀 다시 시도해 주세요.")
             st.stop()
 
-        with st.spinner("후보를 '명확한 기준'으로 정렬하는 중..."):
-            ranked_candidates = rank_candidates_with_rules(
-                candidates=candidates,
-                intent_pack=intent_pack,
-                naver_client_id=naver_client_id,
-                naver_client_secret=naver_client_secret,
-                blog_sort_param=blog_sort_param,
-            )
-
         st.session_state["candidate_cache_key"] = cache_key
         st.session_state["candidates"] = candidates
-        st.session_state["ranked_candidates"] = ranked_candidates
-        st.session_state["intent_pack"] = intent_pack
 
-    # 검증용(원하면 숨겨도 됨)
-    with st.expander("🔎 이번 추천에 사용된 기준/후보(검증)"):
-        st.write(f"- 판정 intent: **{intent_pack.get('intent','일반')}**")
-        if intent_pack.get("notes"):
-            st.caption(f"판정 메모: {intent_pack.get('notes')}")
-        if intent_pack.get("must_exclude"):
-            st.write(f"- MUST_EXCLUDE: {', '.join(intent_pack.get('must_exclude'))}")
-        st.write(f"- 후보 수: **{len(candidates)}개**")
-        sample_df = pd.DataFrame(ranked_candidates[:25])
-        cols = [c for c in ["score", "name", "category", "address"] if c in sample_df.columns]
+    # 2) 후보 스코어링 + 혼밥 게이트 필터
+    with st.spinner("후보를 정교하게 선별하는 중..."):
+        scored_candidates = score_and_prepare_candidates(payload, candidates, blog_sort_param)
+
+    # (검증: 후보 보기)
+    with st.expander("🔎 이번 추천에 사용된 후보 정보(검증)"):
+        st.write(f"- 후보 수(원본): **{len(candidates)}개**")
+        st.write(f"- 후보 수(스코어링/필터 후): **{len(scored_candidates)}개**")
+        sample_df = pd.DataFrame(scored_candidates[:30])
+        cols = [c for c in ["name", "category", "address", "_score"] if c in sample_df.columns]
         st.dataframe(sample_df[cols], use_container_width=True, hide_index=True)
 
-    with st.spinner("스코어 상위 후보 중에서 최적의 장소를 고르는 중..."):
+        if debug_mode:
+            st.caption("상위 후보 일부의 점수/판정 메모(디버그)")
+            for c in scored_candidates[:10]:
+                st.write(f"- **{c.get('name')}** ({c.get('_score')}): {c.get('_score_notes')}")
+
+    # 3) LLM 최종 추천(후보 중 선택)
+    with st.spinner("후보 중에서 최적의 장소를 고르는 중..."):
         try:
-            r_data = recommend_from_candidates(client, payload, intent_pack, ranked_candidates, TOP_K)
+            pool = scored_candidates[:LLM_RERANK_POOL]
+            r_data = recommend_from_candidates(client, payload, pool)
         except Exception:
             st.error("추천 결과 생성에 실패했어요. (OpenAI 응답 파싱 실패)")
             st.stop()
 
-    # ✅ summary는 개수 혼선 방지를 위해 고정 문구 사용
-    fixed_summary = f"조건에 맞는 추천 TOP {TOP_K} 결과입니다."
     recommendations = r_data.get("recommendations", [])
-
     if not isinstance(recommendations, list) or len(recommendations) == 0:
         st.error("추천 결과 형식이 올바르지 않습니다. 다시 시도해 주세요.")
         st.stop()
 
+    # 정렬/개수 보정
     recommendations = [r for r in recommendations if isinstance(r, dict)]
     recommendations = sorted(recommendations, key=lambda x: safe_int(x.get("rank", 999)))
     recommendations = recommendations[:TOP_K]
-    recommendations = ensure_k_recommendations(recommendations, ranked_candidates, TOP_K)
+    # candidates는 “스코어링 된 후보”를 넣어 보정 품질↑
+    recommendations = ensure_k_recommendations(recommendations, scored_candidates, TOP_K)
 
+    # ✅ summary는 모델 말 그대로 쓰지 않고 고정
+    fixed_summary = f"조건에 맞는 추천 TOP {TOP_K} 결과입니다."
     st.success(f"✅ **{fixed_summary}**")
     st.subheader(f"🏆 추천 TOP {TOP_K} (네이버 후보 기반)")
 
