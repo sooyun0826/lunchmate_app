@@ -2,7 +2,8 @@ import json
 import re
 import time
 import html
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
+from urllib.parse import quote_plus
 
 import requests
 import streamlit as st
@@ -18,6 +19,12 @@ DISTANCE_OPTIONS = ["5분 이내", "10분 이내", "상관없음"]
 DEFAULT_DISTANCE_INDEX = 2  # "상관없음"
 FOOD_OPTIONS = ["한식", "중식", "일식", "양식", "분식", "기타"]
 DEFAULT_FOOD_TYPES: List[str] = []  # 아무 것도 선택 안된 상태
+
+# 후보 확장 / 성능
+MAX_QUERIES = 6
+LOCAL_DISPLAY_PER_QUERY = 5          # 네이버 local API 표시 개수(안전하게 5)
+CANDIDATE_LIMIT_FOR_LLM = 30         # LLM에 넘길 후보 수(너무 크면 혼란/비용↑)
+REQUEST_SLEEP_SEC = 0.08
 
 
 # ===============================
@@ -35,12 +42,20 @@ def get_secret(key: str) -> str:
     return str(st.secrets.get(key, "")).strip()
 
 
+def safe_int(x: Any, default: int = 999) -> int:
+    try:
+        return int(x)
+    except Exception:
+        return default
+
+
 def naver_local_search(
     query: str,
     client_id: str,
     client_secret: str,
     display: int = 5,
     sort: str = "comment",
+    start: int = 1,
 ) -> List[Dict[str, str]]:
     """
     네이버 지역검색 API로 실존 장소 후보 수집
@@ -54,7 +69,7 @@ def naver_local_search(
     params = {
         "query": query,
         "display": max(1, min(display, 5)),
-        "start": 1,
+        "start": max(1, start),
         "sort": sort,
     }
     r = requests.get(url, headers=headers, params=params, timeout=10)
@@ -68,7 +83,6 @@ def naver_local_search(
                 "name": strip_b_tags(it.get("title", "")),
                 "address": it.get("roadAddress") or it.get("address") or "",
                 "category": it.get("category", ""),
-                "tel": it.get("telephone", ""),
                 "link": it.get("link", ""),
             }
         )
@@ -86,6 +100,34 @@ def dedupe_candidates(candidates: List[Dict[str, str]]) -> List[Dict[str, str]]:
         seen.add(key)
         uniq.append(c)
     return uniq
+
+
+def filter_candidates(candidates: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """
+    간단 후보 필터링(신뢰/정확도 개선)
+    - 음식점/식당 후보를 우선
+    - 명백히 비식당 업종 키워드 제거(학원/부동산/미용실 등)
+    """
+    bad_keywords = [
+        "학원", "공인중개", "부동산", "미용", "네일", "피부", "성형",
+        "헬스", "요가", "필라테스", "세탁", "수리", "정비", "렌탈",
+        "교회", "성당", "절", "약국", "병원", "의원", "치과", "한의원",
+        "주유", "자동차", "인테리어", "가구", "마트", "편의점",
+    ]
+    out = []
+    for c in candidates:
+        name = (c.get("name") or "").strip()
+        cat = (c.get("category") or "").strip()
+        blob = f"{name} {cat}"
+        if any(k in blob for k in bad_keywords):
+            continue
+        # category에 음식 관련 힌트가 전혀 없고 이름도 애매하면 제외(너무 공격적이면 품질↓라 완만하게)
+        if cat and ("음식" in cat or "식당" in cat or "주점" in cat or "카페" in cat):
+            out.append(c)
+        else:
+            # 카테고리가 비어있거나 애매해도 이름이 음식점스러운 경우는 살림
+            out.append(c)
+    return out
 
 
 def extract_json_from_text(text: str) -> dict:
@@ -108,7 +150,13 @@ def extract_json_from_text(text: str) -> dict:
     return json.loads(candidate)
 
 
-def llm_json(client: OpenAI, system: str, user: str, model: str = "gpt-4.1-mini", retries: int = 2) -> dict:
+def llm_json(
+    client: OpenAI,
+    system: str,
+    user: str,
+    model: str = "gpt-4.1-mini",
+    retries: int = 2
+) -> dict:
     """chat.completions 기반 JSON 응답 강제"""
     for attempt in range(retries + 1):
         resp = client.chat.completions.create(
@@ -142,7 +190,7 @@ def ensure_three_recommendations(
         return (str(name or "").strip(), str(address or "").strip())
 
     recs = [r for r in recommendations if isinstance(r, dict)]
-    recs = sorted(recs, key=lambda x: int(x.get("rank", 999)))
+    recs = sorted(recs, key=lambda x: safe_int(x.get("rank", 999)))
 
     picked = set()
     cleaned = []
@@ -164,10 +212,11 @@ def ensure_three_recommendations(
                 "rank": len(recs) + 1,
                 "name": c.get("name", ""),
                 "reason": "후보 식당 중 조건과 무난하게 잘 맞는 선택지입니다.",
+                "tags": ["무난", "후보기반"],
                 "address": c.get("address", ""),
                 "category": c.get("category", ""),
-                "tel": c.get("tel", ""),
                 "link": c.get("link", ""),
+                "evidence": ["네이버 지역검색 후보에 존재"],
             })
             if len(recs) == 3:
                 break
@@ -179,10 +228,7 @@ def ensure_three_recommendations(
 
 
 def make_review_query(name: str, address: str) -> str:
-    """
-    후기 검색용 쿼리 생성:
-    - 식당명 + 주소 앞부분(시/구/동 정도) + '후기'
-    """
+    """후기 검색용 쿼리: 식당명 + 주소 앞부분 + '후기'"""
     name = (name or "").strip()
     address = (address or "").strip()
     addr_hint = " ".join(address.split()[:3])
@@ -191,13 +237,24 @@ def make_review_query(name: str, address: str) -> str:
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def naver_blog_search_cached(query: str, client_id: str, client_secret: str, display: int = 3):
+def naver_blog_search_cached(
+    query: str,
+    client_id: str,
+    client_secret: str,
+    display: int = 3,
+    sort: str = "sim",  # sim or date
+):
     url = "https://openapi.naver.com/v1/search/blog.json"
     headers = {
         "X-Naver-Client-Id": client_id,
         "X-Naver-Client-Secret": client_secret,
     }
-    params = {"query": query, "display": max(1, min(display, 5)), "start": 1, "sort": "sim"}
+    params = {
+        "query": query,
+        "display": max(1, min(display, 5)),
+        "start": 1,
+        "sort": sort,
+    }
     r = requests.get(url, headers=headers, params=params, timeout=10)
     r.raise_for_status()
     data = r.json()
@@ -213,56 +270,94 @@ def naver_blog_search_cached(query: str, client_id: str, client_secret: str, dis
     return items
 
 
+def naver_map_search_url(place_name: str, address: str = "") -> str:
+    # 주소를 같이 넣어주면 동명이인(동명가게) 문제 완화
+    q = (place_name or "").strip()
+    if address:
+        q = f"{q} {address.split()[0]}".strip()
+    return f"https://map.naver.com/v5/search/{quote_plus(q)}"
+
+
+def build_cache_key(payload: Dict[str, Any]) -> str:
+    # 후보 캐싱/재사용을 위한 키(조건이 같으면 candidates 재사용)
+    # (너무 세밀하면 캐시가 쪼개지고, 너무 거칠면 엉뚱한 재사용 → 중간 정도)
+    compact = {
+        "start": payload.get("start_location", ""),
+        "situation": payload.get("situation", ""),
+        "people": payload.get("people", 0),
+        "distance": payload.get("distance_pref", ""),
+        "food": payload.get("food_type", []),
+        "exclude": payload.get("exclude", ""),
+        "prefer": payload.get("prefer", ""),
+    }
+    return json.dumps(compact, ensure_ascii=False, sort_keys=True)
+
+
 # ===============================
 # Streamlit UI
 # ===============================
 st.set_page_config(page_title="LunchMate 🍱", layout="wide")
 st.title("🍽️ LunchMate 🍽️")
-st.caption("사용자님의 상황과 선호도를 바탕으로 관련된 음식점 후보 중 최적의 3곳을 추천해 드립니다.")
+st.caption("사용자님의 상황과 선호도를 바탕으로 ‘실제 존재하는’ 후보 중 최적의 3곳을 추천해 드립니다.")
 
-# ✅ Secrets 로드 (사이드바 '연결 상태' UI는 없음)
+# ✅ Secrets 로드 (연결 상태 UI는 표시하지 않음)
 naver_client_id = get_secret("NAVER_CLIENT_ID")
 naver_client_secret = get_secret("NAVER_CLIENT_SECRET")
 openai_api_key = get_secret("OPENAI_API_KEY")
 
+# 세션 상태(후보 캐싱/재추천)
+if "candidate_cache_key" not in st.session_state:
+    st.session_state["candidate_cache_key"] = None
+if "candidates" not in st.session_state:
+    st.session_state["candidates"] = []
+if "last_payload" not in st.session_state:
+    st.session_state["last_payload"] = None
+if "last_recommendations" not in st.session_state:
+    st.session_state["last_recommendations"] = None
+if "last_summary" not in st.session_state:
+    st.session_state["last_summary"] = None
+
+
 # ===============================
-# 사이드바: 검색 조건
+# 사이드바: 검색 조건 + UX 개선
 # ===============================
+st.sidebar.header("📍 출발 위치(정확도 개선)")
+start_location = st.sidebar.text_input(
+    "출발지(회사/역/주소)",
+    placeholder="예: 신촌역, 강남역, 판교역, OO빌딩",
+)
+
 st.sidebar.header("🔍 검색 조건")
+people = st.sidebar.slider("인원 수", 1, 10, DEFAULT_PEOPLE)
+distance = st.sidebar.selectbox("이동 거리", DISTANCE_OPTIONS, index=DEFAULT_DISTANCE_INDEX)
+food_type = st.sidebar.multiselect("음식 종류", FOOD_OPTIONS, default=DEFAULT_FOOD_TYPES)
 
-people = st.sidebar.slider(
-    "인원 수",
-    min_value=1,
-    max_value=10,
-    value=DEFAULT_PEOPLE,
+st.sidebar.header("🚫 제외 / ✅ 선호 (UX 개선)")
+exclude_text = st.sidebar.text_input(
+    "제외 조건(쉼표로 구분)",
+    placeholder="예: 매운 음식, 회, 웨이팅, 기름진 음식",
 )
-
-distance = st.sidebar.selectbox(
-    "이동 거리",
-    DISTANCE_OPTIONS,
-    index=DEFAULT_DISTANCE_INDEX,
-)
-
-food_type = st.sidebar.multiselect(
-    "음식 종류",
-    FOOD_OPTIONS,
-    default=DEFAULT_FOOD_TYPES,
+prefer_text = st.sidebar.text_input(
+    "선호 조건(쉼표로 구분)",
+    placeholder="예: 조용한 곳, 가성비, 혼밥, 단체석",
 )
 
 st.sidebar.header("🖼️ 후기/사진 설정")
-show_reviews = st.sidebar.checkbox("후기(블로그) 표시", value=True)
+show_reviews = st.sidebar.checkbox("블로그 후기 표시", value=True)
 review_display = st.sidebar.slider("식당당 블로그 후기 개수", 1, 3, 2)
+blog_sort = st.sidebar.radio("후기 정렬", ["연관도(추천)", "최신순"], index=0)
+blog_sort_param = "sim" if blog_sort.startswith("연관도") else "date"
 
-
-
+st.sidebar.divider()
+st.sidebar.caption("Tip: 출발지를 적으면 후보 품질이 확 좋아져요. (예: ‘신촌역’)")
 
 # ===============================
 # 메인 입력
 # ===============================
 st.subheader("📝 희망 조건을 자유롭게 입력해 주세요")
 situation = st.text_area(
-    "자연스럽게 입력해 주세요(사용자님의 음식 선호, 취향, 방문 지역, 방문자 수, 상황 등)",
-    placeholder="예: 오늘 친구들과 신촌역 근처에서 점심 식사를 하려고 해. 분위기 좋은 중식 식당으로 추천해줘.",
+    "자연스럽게 입력해 주세요(음식 선호, 취향, 방문 지역, 상황 등)",
+    placeholder="예: 오늘 친구들과 신촌역 근처에서 점심. 분위기 좋은 중식 식당!",
 )
 
 col1, col2, col3 = st.columns(3)
@@ -279,68 +374,182 @@ with col3:
 st.write("")
 
 # ===============================
-# 추천 버튼
+# 동작 유틸: 후보 만들기 / 추천 만들기
 # ===============================
-if st.button("🤖 점심 추천 받기"):
+def require_secrets_or_stop():
+    # UI는 숨기되, 없으면 동작 불가
+    if not (naver_client_id and naver_client_secret and openai_api_key):
+        st.error("서비스 설정 오류가 발생했습니다. 잠시 후 다시 시도해 주세요.")
+        st.stop()
+
+
+def generate_queries(client: OpenAI, payload: Dict[str, Any]) -> List[str]:
+    # “출발지”를 검색어에 강하게 반영(정확도 개선)
+    system_query = (
+        "너는 네이버 지역검색 API에 넣을 '검색어(queries)'를 생성하는 도우미다.\n"
+        "- 식당 이름을 절대 만들지 마라.\n"
+        "- 반드시 사용자의 출발지(지역/역/주소) 정보를 queries에 반영하라.\n"
+        "- 너무 길게 쓰지 말고, 검색에 잘 걸리는 짧은 키워드 조합으로.\n"
+        "- 출력은 JSON만. 스키마: { \"queries\": [\"...\", \"...\"] }\n"
+        "- queries는 3~6개.\n"
+        "- 음식 종류가 비어있으면 일반적인 키워드도 섞어라."
+    )
+
+    food = payload.get("food_type") or []
+    food_str = ", ".join(food) if food else "(선택 없음)"
+    user_query = (
+        f"출발지: {payload.get('start_location') or '(미입력)'}\n"
+        f"상황: {payload.get('situation')}\n"
+        f"인원: {payload.get('people')}\n"
+        f"이동거리 선호: {payload.get('distance_pref')}\n"
+        f"선호 음식: {food_str}\n"
+        f"제외 조건: {payload.get('exclude') or '(없음)'}\n"
+        f"선호 조건: {payload.get('prefer') or '(없음)'}\n\n"
+        "네이버 지역검색에 넣을 queries 3~6개를 만들어줘."
+    )
+
+    q_data = llm_json(client, system_query, user_query)
+    queries = q_data.get("queries", [])
+    queries = [q.strip() for q in queries if isinstance(q, str) and q.strip()]
+    # 출발지가 있다면, 출발지 없는 query를 보정(정확도)
+    start = (payload.get("start_location") or "").strip()
+    if start:
+        patched = []
+        for q in queries:
+            if start in q:
+                patched.append(q)
+            else:
+                patched.append(f"{start} {q}".strip())
+        queries = patched
+    # 중복 제거
+    uniq = []
+    seen = set()
+    for q in queries:
+        if q in seen:
+            continue
+        seen.add(q)
+        uniq.append(q)
+    return uniq[:MAX_QUERIES]
+
+
+def collect_candidates(queries: List[str]) -> List[Dict[str, str]]:
+    candidates: List[Dict[str, str]] = []
+    for q in queries[:MAX_QUERIES]:
+        candidates.extend(
+            naver_local_search(
+                query=q,
+                client_id=naver_client_id,
+                client_secret=naver_client_secret,
+                display=LOCAL_DISPLAY_PER_QUERY,
+                sort="comment",
+                start=1,
+            )
+        )
+        time.sleep(REQUEST_SLEEP_SEC)
+
+    candidates = dedupe_candidates(candidates)
+    candidates = filter_candidates(candidates)
+    return candidates
+
+
+def recommend_from_candidates(client: OpenAI, payload: Dict[str, Any], candidates: List[Dict[str, str]]) -> Dict[str, Any]:
+    """
+    신뢰(근거·검증) 개선:
+    - tags(근거 요소 태그) + evidence(후보 근거) 포함
+    - candidates 밖 추천 금지
+    """
+    system_rec = (
+        "너는 점심 추천 큐레이터다.\n"
+        "- 반드시 candidates 목록에 있는 식당만 추천할 수 있다.\n"
+        "- candidates에 없는 식당을 새로 만들면 실패다.\n"
+        "- 숫자(평점/가격/거리/시간)는 근거 데이터가 없으면 절대 지어내지 마라.\n"
+        "- 출력은 JSON만.\n"
+        "스키마:\n"
+        "{\n"
+        "  \"summary\": \"한 줄 결론\",\n"
+        "  \"recommendations\": [\n"
+        "    {\n"
+        "      \"rank\": 1,\n"
+        "      \"name\": \"...\",\n"
+        "      \"reason\": \"...\",\n"
+        "      \"tags\": [\"#조용함\", \"#단체\", \"#해장\"],\n"
+        "      \"evidence\": [\"candidates에 존재\", \"카테고리: ...\", \"주소: ...\"],\n"
+        "      \"address\": \"...\",\n"
+        "      \"category\": \"...\",\n"
+        "      \"link\": \"...\"\n"
+        "    }\n"
+        "  ]\n"
+        "}\n"
+        "- recommendations는 1~3개, rank는 1부터."
+    )
+
+    llm_payload = {
+        "start_location": payload.get("start_location", ""),
+        "situation": payload.get("situation", ""),
+        "people": payload.get("people", 0),
+        "distance_pref": payload.get("distance_pref", ""),
+        "food_type": payload.get("food_type", []),
+        "exclude": payload.get("exclude", ""),
+        "prefer": payload.get("prefer", ""),
+        "candidates": candidates[:CANDIDATE_LIMIT_FOR_LLM],
+    }
+    user_rec = json.dumps(llm_payload, ensure_ascii=False)
+
+    r_data = llm_json(client, system_rec, user_rec)
+    return r_data
+
+
+# ===============================
+# 버튼 영역 (UX: 재추천)
+# ===============================
+btn1, btn2 = st.columns([1, 1])
+with btn1:
+    run_search = st.button("🤖 점심 추천 받기", use_container_width=True)
+with btn2:
+    reroll = st.button("🔄 후보 그대로 다시 추천", use_container_width=True)
+
+# ===============================
+# 실행
+# ===============================
+if run_search or reroll:
     if not situation:
         st.warning("상황을 입력해 주세요.")
         st.stop()
 
-    # 🔒 연결 상태 UI는 숨겼지만, 설정이 없으면 서비스가 동작할 수 없어서 여기서만 검사
-    if not (naver_client_id and naver_client_secret):
-        st.error("서비스 설정 오류가 발생했습니다. 잠시 후 다시 시도해 주세요.")
-        st.stop()
-
-    if not openai_api_key:
-        st.error("서비스 설정 오류가 발생했습니다. 잠시 후 다시 시도해 주세요.")
-        st.stop()
-
+    require_secrets_or_stop()
     client = OpenAI(api_key=openai_api_key)
 
-    # 1) OpenAI로 '네이버 지역검색에 넣을 검색어' 생성
-    system_query = (
-        "너는 네이버 지역검색 API에 넣을 '검색어'를 생성하는 도우미다.\n"
-        "- 식당 이름을 절대 만들지 마라.\n"
-        "- 검색에 잘 걸릴 짧은 키워드 조합만 만들어라.\n"
-        "- 출력은 JSON만. 스키마: { \"queries\": [\"...\", \"...\"] }\n"
-        "- queries는 2~6개."
-    )
-    user_query = (
-        f"상황: {situation}\n"
-        f"인원: {people}\n"
-        f"이동거리 선호: {distance}\n"
-        f"선호 음식: {', '.join(food_type) if food_type else '상관없음'}\n\n"
-        "네이버 지역검색에 넣을 queries 2~6개를 만들어줘."
-    )
+    payload = {
+        "start_location": start_location.strip(),
+        "situation": situation.strip(),
+        "people": people,
+        "distance_pref": distance,
+        "food_type": food_type,
+        "exclude": exclude_text.strip(),
+        "prefer": prefer_text.strip(),
+    }
+    cache_key = build_cache_key(payload)
 
-    with st.spinner("조건을 분석 중..."):
-        try:
-            q_data = llm_json(client, system_query, user_query)
-            queries = q_data.get("queries", [])
-        except Exception:
-            st.error("검색어 생성에 실패했어요. (OpenAI 응답 파싱 실패)")
+    # reroll인데 후보가 없거나 조건이 바뀌면 후보를 새로 만듦
+    candidates: List[Dict[str, str]] = []
+    if reroll and st.session_state.get("candidates") and st.session_state.get("candidate_cache_key") == cache_key:
+        candidates = st.session_state["candidates"]
+    else:
+        # 후보 새로 수집(정확도 개선: 출발지/조건 반영)
+        with st.spinner("조건을 분석 중..."):
+            try:
+                queries = generate_queries(client, payload)
+            except Exception:
+                st.error("검색어 생성에 실패했어요. (OpenAI 응답 파싱 실패)")
+                st.stop()
+
+        if not queries:
+            st.warning("검색어를 만들지 못했어요. 입력을 조금 더 구체적으로 적어주세요.")
             st.stop()
 
-    queries = [q.strip() for q in queries if isinstance(q, str) and q.strip()]
-    if not queries:
-        st.warning("검색어를 만들지 못했어요. 입력을 조금 더 구체적으로 적어주세요.")
-        st.stop()
-
-    # 2) 네이버 지역검색으로 '실존 후보' 수집
-    with st.spinner("주변 실제 식당 후보를 찾는 중..."):
-        candidates: List[Dict[str, str]] = []
-        for q in queries[:6]:
+        with st.spinner("주변 실제 식당 후보를 찾는 중..."):
             try:
-                candidates.extend(
-                    naver_local_search(
-                        query=q,
-                        client_id=naver_client_id,
-                        client_secret=naver_client_secret,
-                        display=5,
-                        sort="comment",
-                    )
-                )
-                time.sleep(0.08)
+                candidates = collect_candidates(queries)
             except requests.HTTPError as e:
                 st.error(f"네이버 지역검색 API 호출 실패(HTTP): {e}")
                 st.stop()
@@ -348,40 +557,28 @@ if st.button("🤖 점심 추천 받기"):
                 st.error(f"네트워크 오류: {e}")
                 st.stop()
 
-        candidates = dedupe_candidates(candidates)
+        if not candidates:
+            st.warning("조건에 맞는 실제 식당 후보를 찾지 못했어요. 키워드를 넓혀 다시 시도해 주세요.")
+            st.stop()
 
-    if not candidates:
-        st.warning("조건에 맞는 실제 식당 후보를 찾지 못했어요. 키워드를 넓혀 다시 시도해 주세요.")
-        st.stop()
+        # 세션에 후보 저장(UX: 재추천)
+        st.session_state["candidate_cache_key"] = cache_key
+        st.session_state["candidates"] = candidates
+        st.session_state["last_payload"] = payload
 
-    # 3) 후보 안에서만 TOP3 추천 + 이유 생성 (후보 밖 금지)
-    system_rec = (
-        "너는 점심 추천 큐레이터다.\n"
-        "- 반드시 candidates 목록에 있는 식당만 추천할 수 있다.\n"
-        "- candidates에 없는 식당을 새로 만들면 실패다.\n"
-        "- 숫자(평점/가격/거리/시간)는 근거 데이터가 없으면 절대 지어내지 마라.\n"
-        "- 추천은 최대 3개.\n"
-        "- 출력은 JSON만. 스키마:\n"
-        "{\n"
-        "  \"summary\": \"한 줄 결론\",\n"
-        "  \"recommendations\": [\n"
-        "    {\"rank\": 1, \"name\": \"...\", \"reason\": \"...\", \"address\": \"...\", \"category\": \"...\", \"tel\": \"...\", \"link\": \"...\"}\n"
-        "  ]\n"
-        "}\n"
-    )
+    # 후보 통계(신뢰)
+    with st.expander("🔎 이번 추천에 사용된 후보 정보(신뢰/검증)"):
+        st.write(f"- 후보 수: **{len(candidates)}개**")
+        if st.session_state.get("candidate_cache_key") == cache_key:
+            st.caption("같은 조건이면 후보를 재사용하여 더 빠르게 추천합니다.")
+        sample_df = pd.DataFrame(candidates[:15])
+        cols = [c for c in ["name", "category", "address"] if c in sample_df.columns]
+        st.dataframe(sample_df[cols], use_container_width=True, hide_index=True)
 
-    payload = {
-        "situation": situation,
-        "people": people,
-        "distance_pref": distance,
-        "food_type": food_type,
-        "candidates": candidates[:25],
-    }
-    user_rec = json.dumps(payload, ensure_ascii=False)
-
+    # 추천 생성(후보 기반)
     with st.spinner("후보 중에서 최적의 3곳을 고르는 중..."):
         try:
-            r_data = llm_json(client, system_rec, user_rec)
+            r_data = recommend_from_candidates(client, payload, candidates)
         except Exception:
             st.error("추천 결과 생성에 실패했어요. (OpenAI 응답 파싱 실패)")
             st.stop()
@@ -394,40 +591,64 @@ if st.button("🤖 점심 추천 받기"):
         st.stop()
 
     recommendations = [r for r in recommendations if isinstance(r, dict)]
-    recommendations = sorted(recommendations, key=lambda x: int(x.get("rank", 999)))
+    recommendations = sorted(recommendations, key=lambda x: safe_int(x.get("rank", 999)))
     recommendations = recommendations[:3]
     recommendations = ensure_three_recommendations(recommendations, candidates)
 
+    # 세션 저장(UX)
+    st.session_state["last_recommendations"] = recommendations
+    st.session_state["last_summary"] = summary
+
     # ===============================
-    # 출력 UI (전화 정보 제거)
+    # 출력 UI (신뢰: 태그/근거 + 지도 링크)
     # ===============================
     st.success(f"✅ **{summary}**")
     st.subheader("🏆 추천 식당 TOP 3 (네이버 후보 기반)")
 
     for r in recommendations:
+        name = r.get("name", "이름 없음")
+        address = r.get("address", "") or "정보 없음"
+        category = r.get("category", "") or "정보 없음"
+        reason = r.get("reason", "")
+        tags = r.get("tags", [])
+        evidence = r.get("evidence", [])
+
         with st.container():
             left, right = st.columns([3, 2])
 
             with left:
-                st.markdown(f"### {r.get('rank', '')}️⃣ {r.get('name', '이름 없음')}")
-                st.write(f"📌 **추천 이유**: {r.get('reason', '')}")
-                st.write(f"🏷️ **카테고리**: {r.get('category', '') or '정보 없음'}")
-                st.write(f"📍 **주소**: {r.get('address', '') or '정보 없음'}")
+                st.markdown(f"### {r.get('rank', '')}️⃣ {name}")
+                if tags and isinstance(tags, list):
+                    tag_line = " ".join([t if str(t).startswith("#") else f"#{t}" for t in tags[:8]])
+                    st.caption(tag_line)
+                st.write(f"📌 **추천 이유**: {reason}")
+                st.write(f"🏷️ **카테고리**: {category}")
+                st.write(f"📍 **주소**: {address}")
 
             with right:
+                # 지도에서 보기(UX/신뢰)
+                st.link_button("🗺️ 네이버 지도에서 보기", naver_map_search_url(name, address))
                 if r.get("link"):
-                    st.link_button("네이버/예약 링크 열기", r["link"])
-                else:
-                    st.write("🔗 **링크**: 정보 없음")
+                    st.link_button("🔗 네이버/예약 링크", r["link"])
+                st.write("")  # 여백
 
+            # 근거(신뢰)
+            if evidence and isinstance(evidence, list):
+                with st.expander("🧾 추천 근거(요약)"):
+                    for ev in evidence[:6]:
+                        if ev:
+                            st.write(f"- {ev}")
+
+            # 블로그 후기(사진)
             if show_reviews:
-                q = make_review_query(r.get("name", ""), r.get("address", ""))
+                q = make_review_query(name, r.get("address", ""))
                 with st.expander("🖼️ 블로그 후기 보기"):
-                    st.caption(f"검색어: {q}")
-
+                    st.caption(f"검색어: {q} | 정렬: {blog_sort}")
                     try:
                         blog_posts = naver_blog_search_cached(
-                            q, naver_client_id, naver_client_secret, display=review_display
+                            q, naver_client_id, naver_client_secret,
+                            display=review_display,
+                            sort=blog_sort_param,
                         )
                     except Exception:
                         blog_posts = []
@@ -436,7 +657,6 @@ if st.button("🤖 점심 추천 받기"):
                     if not blog_posts:
                         st.write("관련 블로그 후기를 찾지 못했어요.")
                     else:
-                        st.markdown("**📝 블로그 후기**")
                         for p in blog_posts[:review_display]:
                             cols = st.columns([1, 3])
                             with cols[0]:
@@ -455,4 +675,4 @@ if st.button("🤖 점심 추천 받기"):
     st.dataframe(df[cols], use_container_width=True, hide_index=True)
 
 else:
-    st.info("👆 상황을 입력하고 **점심 추천 받기** 버튼을 눌러주세요.")
+    st.info("👆 조건을 입력하고 **점심 추천 받기** 버튼을 눌러주세요.")
