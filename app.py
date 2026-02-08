@@ -110,7 +110,6 @@ def dedupe_candidates(candidates: List[Dict[str, str]]) -> List[Dict[str, str]]:
 def filter_candidates(candidates: List[Dict[str, str]]) -> List[Dict[str, str]]:
     """
     ✅ 음식점/카페 추천 서비스 기준으로, 명백히 비식음료 업종만 제거
-    (병원/학원/부동산 등)
     """
     bad_keywords = [
         "학원", "공인중개", "부동산", "미용", "네일", "피부", "성형",
@@ -292,27 +291,20 @@ def build_cache_key(payload: Dict[str, Any]) -> str:
 # ===============================
 st.set_page_config(page_title="LunchMate 🍱", layout="wide")
 
-# ✅ 스크롤 잠김 방지 CSS (중요)
+# ✅ 스크롤 잠김 방지 CSS
 st.markdown(
     """
     <style>
-    html, body {
-        overflow: auto !important;
-        height: auto !important;
-    }
-    [data-testid="stAppViewContainer"] {
-        overflow: auto !important;
-    }
-    [data-testid="stMain"] {
-        overflow: auto !important;
-    }
+    html, body { overflow: auto !important; height: auto !important; }
+    [data-testid="stAppViewContainer"] { overflow: auto !important; }
+    [data-testid="stMain"] { overflow: auto !important; }
     </style>
     """,
     unsafe_allow_html=True
 )
 
 st.title("🍽️ LunchMate 🍽️")
-st.caption("사용자님의 상황과 선호도를 바탕으로 음식점/카페 후보 중 최적의 5곳을 추천해 드립니다.")
+st.caption(f"사용자님의 상황과 선호도를 바탕으로 음식점/카페 후보 중 최적의 {TOP_K}곳을 추천해 드립니다.")
 
 naver_client_id = get_secret("NAVER_CLIENT_ID")
 naver_client_secret = get_secret("NAVER_CLIENT_SECRET")
@@ -359,12 +351,12 @@ blog_sort_param = "sim" if blog_sort.startswith("연관도") else "date"
 st.subheader("📝 희망 조건을 자유롭게 입력해 주세요")
 situation = st.text_area(
     "자연스럽게 입력해 주세요(취향, 방문 지역, 방문자 수, 상황 등)",
-    placeholder="예: 오늘 친구와 신촌역 근처에서 점심 먹을거야. 분위기 좋은 중식 음식점 추천해줘. / 신촌에 카공하기 좋은 카페 가고 싶어.",
+    placeholder="예: 을지로에서 분위기 좋은 고기안주 술집 찾고 있어. / 신촌에서 카공하기 좋은 카페 추천해줘.",
 )
 
 col1, col2, col3, col4 = st.columns(4)
 with col1:
-    if st.button("⚡ 빨리 먹기"):
+    if st.button("⚡ 빨리 이용"):
         situation = "시간이 없어서 빨리 이용할 수 있는 곳을 찾고 있어요"
 with col2:
     if st.button("👥 모임/회식"):
@@ -579,7 +571,8 @@ if run_search or reroll:
             st.error("추천 결과 생성에 실패했어요. (OpenAI 응답 파싱 실패)")
             st.stop()
 
-    summary = r_data.get("summary", "추천 결과를 확인해 주세요.")
+    # ✅ summary는 모델 말을 그대로 쓰지 않고, TOP_K를 기준으로 고정 문구로 표시 (핵심 수정)
+    fixed_summary = f"조건에 맞는 추천 TOP {TOP_K} 결과입니다."
     recommendations = r_data.get("recommendations", [])
 
     if not isinstance(recommendations, list) or len(recommendations) == 0:
@@ -591,7 +584,7 @@ if run_search or reroll:
     recommendations = recommendations[:TOP_K]
     recommendations = ensure_k_recommendations(recommendations, candidates, TOP_K)
 
-    st.success(f"✅ **{summary}**")
+    st.success(f"✅ **{fixed_summary}**")
     st.subheader(f"🏆 추천 TOP {TOP_K} (네이버 후보 기반)")
 
     for r in recommendations:
