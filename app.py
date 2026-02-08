@@ -220,16 +220,6 @@ st.set_page_config(page_title="LunchMate 🍱", layout="wide")
 st.title("🍽️ LunchMate")
 st.caption("사용자님의 상황과 선호도를 바탕으로 관련된 음식점 후보 중 최적의 3곳을 추천해 드립니다")
 
-# Secrets 상태 표시
-st.sidebar.header("🔐 연결 상태")
-naver_client_id = get_secret("NAVER_CLIENT_ID")
-naver_client_secret = get_secret("NAVER_CLIENT_SECRET")
-openai_api_key = get_secret("OPENAI_API_KEY")
-
-st.sidebar.write("네이버 API:", "✅" if (naver_client_id and naver_client_secret) else "❌ (Secrets 필요)")
-st.sidebar.write("OpenAI API:", "✅" if openai_api_key else "❌ (Secrets 필요)")
-st.sidebar.caption("Streamlit Cloud → Settings → Secrets 에 키를 넣어야 합니다.")
-
 st.sidebar.header("🔍 검색 조건")
 
 # ✅ 디폴트: 인원수 2
