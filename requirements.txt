@@ -59,4 +59,5 @@ pandas
 requests
 openai
 matplotlib
+beautifulsoup4
 
