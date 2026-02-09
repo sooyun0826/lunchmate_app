@@ -532,10 +532,13 @@ if "candidate_cache_key" not in st.session_state:
     st.session_state["candidate_cache_key"] = None
 if "candidates" not in st.session_state:
     st.session_state["candidates"] = []
+# ✅ 메인에 위치한 빠른 태그 상태 유지
+if "quick_tags_main" not in st.session_state:
+    st.session_state["quick_tags_main"] = []
 
 
 # ===============================
-# 사이드바
+# 사이드바 (✅ 빠른 태그 제거!)
 # ===============================
 st.sidebar.header("🕒 매장 방문 목적")
 visit_type = st.sidebar.selectbox(
@@ -558,18 +561,6 @@ st.sidebar.header("🚫 제외 / ✅ 선호")
 exclude_text = st.sidebar.text_input("제외 조건(쉼표로 구분)", placeholder="예: 매운 음식, 회, 웨이팅")
 prefer_text = st.sidebar.text_input("선호 조건(쉼표로 구분)", placeholder="예: 조용한 곳, 가성비, 디저트")
 
-st.sidebar.header("🧩 빠른 태그(복수 선택 가능)")
-QUICK_TAGS = [
-    "혼밥", "조용한", "가성비", "웨이팅 적은", "매운 음식",
-    "데이트", "단체 가능", "포장/테이크아웃",
-    "다이어트", "비건", "샐러드", "디저트", "브런치",
-    "야식", "술/안주", "카공",
-]
-quick_tags = st.sidebar.multiselect("원하는 키워드를 선택하세요", QUICK_TAGS, default=[])
-
-if quick_tags:
-    st.sidebar.success(f"선택됨: {', '.join(quick_tags)}")
-
 st.sidebar.header("🖼️ 후기/사진 설정")
 show_reviews = st.sidebar.checkbox("블로그 후기 표시", value=True)
 review_display = st.sidebar.slider("장소당 블로그 후기 개수", 1, 3, 2)
@@ -581,13 +572,34 @@ debug_mode = st.sidebar.checkbox("🧪 디버그(후보 점수/필터 보기)", 
 
 
 # ===============================
-# 메인 입력 (빠른 입력 버튼 제거!)
+# 메인 입력 (✅ 빠른 태그를 프롬프트 바로 아래로 이동)
 # ===============================
 st.subheader("📝 희망 조건을 자유롭게 입력해 주세요")
 situation = st.text_area(
     "자유롭게 상황을 입력해 주세요(취향, 방문 지역, 인원 수, 식사 상황 등)",
     placeholder="예: 신촌역에서 친구와 점심 먹을거야. 가성비 좋은 중식 음식점 추천해줘. / 잠실에서 카공하기 좋은 카페 찾아줘.",
 )
+
+# ✅ 프롬프트 입력란 바로 아래에 '빠른 태그' 배치
+st.markdown("### 🧩 빠른 태그(복수 선택 가능)")
+QUICK_TAGS = [
+    "혼밥", "조용한", "가성비", "웨이팅 적은", "매운 음식",
+    "데이트", "단체 가능", "포장/테이크아웃",
+    "다이어트", "비건", "샐러드", "디저트", "브런치",
+    "야식", "술/안주", "카공",
+]
+quick_tags = st.multiselect(
+    "원하는 키워드를 선택하세요",
+    QUICK_TAGS,
+    default=st.session_state.get("quick_tags_main", []),
+    key="quick_tags_main",
+)
+
+# ✅ 적용 표시(사용자 가시성)
+if quick_tags:
+    st.success(f"✅ 빠른 태그 적용됨: {', '.join(quick_tags)}")
+else:
+    st.caption("선택한 빠른 태그가 없어요. 필요하면 위에서 골라주세요.")
 
 st.write("")
 
@@ -820,7 +832,7 @@ if run_search or reroll:
         "people": people,  # 0이면 상관없음
         "distance_pref": distance,
         "food_type": food_type,
-        "quick_tags": quick_tags,
+        "quick_tags": quick_tags,  # ✅ 이제 메인 입력 아래에서 선택된 값
         "exclude": exclude_text.strip(),
         "prefer": prefer_text.strip(),
         "blog_sort": blog_sort_param,
@@ -927,7 +939,6 @@ if run_search or reroll:
                     thumb = img_items[0].get("thumbnail")
                     if thumb:
                         st.image(thumb, use_container_width=True)
-                        # 출처 확인용(원하면 유지, 싫으면 제거 가능)
                         src = img_items[0].get("link")
                         if src:
                             st.link_button("이미지 출처", src)
