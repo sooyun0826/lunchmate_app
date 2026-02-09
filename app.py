@@ -459,7 +459,6 @@ def score_candidate_for_payload(
             score += 15 if visit == "저녁" else 0
 
     score += 10
-
     meta = {"score": score, "score_notes": reasons[:8]}
     return score, meta
 
@@ -502,7 +501,7 @@ naver_client_id = get_secret("NAVER_CLIENT_ID")
 naver_client_secret = get_secret("NAVER_CLIENT_SECRET")
 openai_api_key = get_secret("OPENAI_API_KEY")
 
-# ✅ session_state 초기화(중요)
+# ✅ session_state 초기화
 if "candidate_cache_key" not in st.session_state:
     st.session_state["candidate_cache_key"] = None
 if "candidates" not in st.session_state:
@@ -511,6 +510,8 @@ if "ui_applied_message" not in st.session_state:
     st.session_state["ui_applied_message"] = ""
 if "quick_tags" not in st.session_state:
     st.session_state["quick_tags"] = []
+if "prev_quick_tags" not in st.session_state:
+    st.session_state["prev_quick_tags"] = []
 if "situation_text" not in st.session_state:
     st.session_state["situation_text"] = ""
 
@@ -554,7 +555,6 @@ debug_mode = st.sidebar.checkbox("🧪 디버그(후보 점수/필터 보기)", 
 # ===============================
 st.subheader("📝 희망 조건을 자유롭게 입력해 주세요")
 
-# ✅ text_area는 session_state["situation_text"]를 사용
 situation = st.text_area(
     "자연스럽게 입력해 주세요(취향, 방문 지역, 상황 등)",
     placeholder="예: 별내동에서 혼밥하기 좋은 가성비 맛집 추천해줘 / 카공하기 좋은 카페 추천해줘",
@@ -568,62 +568,39 @@ quick_tag_options = [
     "다이어트", "비건", "글루텐프리", "매운맛", "안매운맛",
     "노키즈/조용", "반려동물", "테이크아웃", "포장",
 ]
+
+def on_quick_tags_change():
+    cur = st.session_state.get("quick_tags_multiselect", [])
+    prev = st.session_state.get("prev_quick_tags", [])
+    st.session_state["quick_tags"] = cur
+    st.session_state["prev_quick_tags"] = cur
+
+    added = [x for x in cur if x not in prev]
+    removed = [x for x in prev if x not in cur]
+
+    if added and not removed:
+        st.session_state["ui_applied_message"] = f"✅ 태그 적용: {', '.join(added)}"
+    elif removed and not added:
+        st.session_state["ui_applied_message"] = f"✅ 태그 해제: {', '.join(removed)}"
+    elif added and removed:
+        st.session_state["ui_applied_message"] = f"✅ 태그 변경 (추가: {', '.join(added)} / 해제: {', '.join(removed)})"
+    else:
+        st.session_state["ui_applied_message"] = "✅ 태그가 적용되었습니다."
+
 selected_quick_tags = st.multiselect(
     "원하는 키워드를 선택하세요",
     quick_tag_options,
     default=st.session_state.get("quick_tags", []),
     key="quick_tags_multiselect",
+    on_change=on_quick_tags_change,
 )
-st.session_state["quick_tags"] = selected_quick_tags
-render_chips(selected_quick_tags)
 
-applied_box = st.empty()
+render_chips(st.session_state.get("quick_tags", []))
+
 if st.session_state.get("ui_applied_message"):
-    applied_box.success(st.session_state["ui_applied_message"])
-
-
-# ✅ 콜백 기반(오류 방지): 버튼 클릭 시 state를 안전하게 갱신
-def apply_preset(label: str, text: str, tag_add: List[str] | None = None):
-    st.session_state["situation_text"] = text
-    st.session_state["ui_applied_message"] = f"✅ '{label}' 키워드가 적용되었습니다."
-    if tag_add:
-        cur = set(st.session_state.get("quick_tags", []))
-        for t in tag_add:
-            cur.add(t)
-        st.session_state["quick_tags"] = sorted(cur)
-
-
-st.markdown("#### ⚡ 빠른 입력 버튼")
-preset_buttons = [
-    ("⚡ 빨리 이용", "시간이 없어서 빨리 이용할 수 있는 곳을 찾고 있어요", ["빨리 이용"]),
-    ("🍱 혼밥", "혼자 먹기 편한 곳(혼밥 가능), 부담 없는 메뉴로 추천해줘", ["혼밥"]),
-    ("👥 모임/회식", "여럿이 앉기 편하고 대화하기 좋은 모임 장소가 필요해요", ["모임/회식"]),
-    ("🥣 해장", "해장에 좋은 음식이 먹고 싶어요(국물/칼칼/속편한)", ["해장"]),
-    ("☕ 카페", "커피/디저트가 괜찮고 오래 앉기 편한 카페를 찾고 있어요", ["카페"]),
-    ("🥗 다이어트", "다이어트 중이라 샐러드/포케/저칼로리/고단백 메뉴 위주로 추천해줘", ["다이어트"]),
-    ("🥬 비건", "비건/채식 옵션이 있거나 채식 위주로 먹기 좋은 곳을 추천해줘", ["비건"]),
-    ("💸 가성비", "가성비 좋고 부담 없는 가격대의 식당으로 추천해줘", ["가성비"]),
-    ("💑 데이트", "분위기 좋은 데이트 코스로 괜찮은 곳으로 추천해줘", ["데이트"]),
-    ("🍺 술/안주", "안주가 맛있고 분위기 좋은 술집을 찾고 있어요", ["술/안주"]),
-]
-
-cols = st.columns(4)
-for i, (label, text, tags) in enumerate(preset_buttons):
-    with cols[i % 4]:
-        st.button(
-            label,
-            use_container_width=True,
-            on_click=apply_preset,
-            args=(label, text, tags),
-        )
+    st.success(st.session_state["ui_applied_message"])
 
 st.write("")
-
-
-def require_secrets_or_stop():
-    if not (naver_client_id and naver_client_secret and openai_api_key):
-        st.error("서비스 설정 오류가 발생했습니다. 잠시 후 다시 시도해 주세요.")
-        st.stop()
 
 
 def generate_queries(client: OpenAI, payload: Dict[str, Any]) -> List[str]:
