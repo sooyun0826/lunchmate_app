@@ -517,17 +517,17 @@ if "quick_tags" not in st.session_state:
 # ===============================
 # 사이드바
 # ===============================
-st.sidebar.header("🕒 매장 방문 목적")
+st.sidebar.header("📍 출발 위치(정확도 개선)")
+start_location = st.sidebar.text_input("출발지(회사/역/주소)", placeholder="예: 신촌역, 강남역, 판교역")
+
+st.sidebar.header("🔍 검색 조건")
+
+# ✅ 매장 방문 목적: "상관없음" 기본
 visit_type = st.sidebar.selectbox(
     "추천 받을 종류",
     ["상관없음", "아침", "점심", "저녁", "카페/디저트"],
     index=0
 )
-
-st.sidebar.header("📍 출발 위치(정확도 개선)")
-start_location = st.sidebar.text_input("출발지(회사/역/주소)", placeholder="예: 신촌역, 강남역, 판교역")
-
-st.sidebar.header("🔍 검색 조건")
 
 # ✅ 인원 수: "상관없음" 기본
 people_choice = st.sidebar.selectbox("인원 수", PEOPLE_OPTIONS, index=DEFAULT_PEOPLE_INDEX)
