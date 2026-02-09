@@ -2,7 +2,7 @@ import json
 import re
 import time
 import html
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 from urllib.parse import quote_plus
 
 import requests
@@ -14,21 +14,19 @@ from openai import OpenAI
 # ===============================
 # 기본 디폴트 설정 (초기값)
 # ===============================
-# ✅ 인원수 디폴트는 "상관없음" (선택형 UI로 구현)
-PEOPLE_OPTIONS = ["상관없음"] + list(range(1, 11))
+# ✅ 인원수 디폴트: '상관없음'
+PEOPLE_OPTIONS = ["상관없음"] + [f"{i}명" for i in range(1, 11)]
 DEFAULT_PEOPLE_INDEX = 0
 
 DISTANCE_OPTIONS = ["5분 이내", "10분 이내", "상관없음"]
 DEFAULT_DISTANCE_INDEX = 2  # "상관없음"
 
-# ✅ “음식점 + 카페”까지 포함하도록 옵션 확장
 FOOD_OPTIONS = [
     "한식", "중식", "일식", "양식", "분식", "기타",
     "카페", "디저트"
 ]
 DEFAULT_FOOD_TYPES: List[str] = []
 
-# ✅ 추천 개수
 TOP_K = 5
 
 # 후보 확장 / 성능
@@ -42,6 +40,9 @@ BLOG_PER_PLACE_FOR_SCORING = 3
 
 # 스코어링 이후 LLM에 넘길 후보 수
 LLM_RERANK_POOL = 25
+
+# ✅ 결과 카드 이미지(이미지 검색 API)
+IMAGE_PER_PLACE = 1  # 1~5 (네이버 이미지 API display 제한에 맞춰 5 이하로 유지)
 
 
 # ===============================
@@ -90,26 +91,13 @@ def count_kw_hits(blob: str, kws: List[str]) -> int:
     return hits
 
 
-def merge_prefer(base: str, extras: List[str]) -> str:
-    base_parts = split_csv(base)
-    for e in extras:
-        if e and e not in base_parts:
-            base_parts.append(e)
-    return ", ".join(base_parts)
-
-
-def render_chips(labels: List[str]) -> None:
-    if not labels:
-        return
-    chips = "".join(
-        [
-            f"<span style='display:inline-block;padding:4px 10px;margin:4px 6px 0 0;"
-            f"border-radius:999px;background:#f1f3f5;border:1px solid #dee2e6;"
-            f"font-size:13px;'>#{html.escape(str(x))}</span>"
-            for x in labels
-        ]
-    )
-    st.markdown(chips, unsafe_allow_html=True)
+def parse_people_value(choice: str) -> int:
+    """'상관없음' -> 0, 'N명' -> N"""
+    choice = (choice or "").strip()
+    if choice == "상관없음":
+        return 0
+    m = re.search(r"(\d+)", choice)
+    return int(m.group(1)) if m else 0
 
 
 def naver_local_search(
@@ -166,7 +154,7 @@ def dedupe_candidates(candidates: List[Dict[str, str]]) -> List[Dict[str, str]]:
 
 def filter_candidates(candidates: List[Dict[str, str]]) -> List[Dict[str, str]]:
     """
-    ✅ 음식점/카페 추천 서비스 기준으로, 명백히 비식음료 업종만 제거
+    음식점/카페 추천 서비스 기준으로, 명백히 비식음료 업종만 제거
     """
     bad_keywords = [
         "학원", "공인중개", "부동산", "미용", "네일", "피부", "성형",
@@ -317,9 +305,40 @@ def naver_blog_search_cached(
             "title": strip_b_tags(html.unescape(it.get("title", ""))),
             "link": it.get("link", ""),
             "desc": strip_b_tags(html.unescape(it.get("description", ""))),
-            "thumbnail": it.get("thumbnail", ""),
         })
     return items
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def naver_image_search_cached(
+    query: str,
+    client_id: str,
+    client_secret: str,
+    display: int = 1,
+    sort: str = "sim",
+):
+    """
+    네이버 이미지 검색 API
+    https://openapi.naver.com/v1/search/image
+    - items[].thumbnail : 섬네일 URL
+    - items[].link      : 원본 이미지 URL
+    """
+    url = "https://openapi.naver.com/v1/search/image"
+    headers = {
+        "X-Naver-Client-Id": client_id,
+        "X-Naver-Client-Secret": client_secret,
+    }
+    params = {
+        "query": query,
+        "display": max(1, min(display, 5)),
+        "start": 1,
+        "sort": sort,        # sim/date
+        "filter": "all",     # all/large/medium/small
+    }
+    r = requests.get(url, headers=headers, params=params, timeout=10)
+    r.raise_for_status()
+    data = r.json()
+    return data.get("items", [])
 
 
 def naver_map_search_url(place_name: str, address: str = "") -> str:
@@ -340,6 +359,7 @@ def build_cache_key(payload: Dict[str, Any]) -> str:
         "prefer": payload.get("prefer", ""),
         "visit_type": payload.get("visit_type", ""),
         "blog_sort": payload.get("blog_sort", "sim"),
+        "quick_tags": payload.get("quick_tags", []),
     }
     return json.dumps(compact, ensure_ascii=False, sort_keys=True)
 
@@ -348,25 +368,27 @@ def build_cache_key(payload: Dict[str, Any]) -> str:
 # “명확한 기준” 룰셋 (혼밥 강화)
 # ===============================
 SOLO_HARD_EXCLUDE = ["웨딩", "대관", "연회", "행사", "세미나", "뷔페", "돌잔치"]
-SOLO_STRONG_PENALTY = ["단체", "단체석", "단체가능", "회식", "모임", "룸", "룸완비", "가족모임", "예약필수", "대형", "연말"]
-SOLO_POSITIVE = ["혼밥", "혼자", "1인", "1인식사", "바자리", "카운터", "키오스크", "회전율", "빠르게", "포장", "테이크아웃"]
+SOLO_STRONG_PENALTY = [
+    "단체", "단체석", "단체가능", "회식", "모임", "룸", "룸완비", "가족모임",
+    "예약필수", "대형", "연말",
+]
+SOLO_POSITIVE = ["혼밥", "혼자", "1인", "1인식사", "바자리", "카운터", "키오스크", "포장", "테이크아웃"]
 SOLO_CATEGORY_PENALTY = ["고기", "삼겹", "갈비", "한우", "무한리필", "바베큐", "곱창", "막창", "참치", "횟집", "대게", "코스", "뷔페"]
 
-BUDGET_POSITIVE = ["가성비", "저렴", "착한가격", "가성비맛집", "만원", "만원대", "점심특선", "세트", "백반"]
+BUDGET_POSITIVE = ["가성비", "저렴", "착한가격", "만원", "만원대", "점심특선", "세트", "백반"]
 BUDGET_NEGATIVE = ["오마카세", "파인다이닝", "코스", "프리미엄", "고급", "비싼", "고가"]
 
 
 def infer_intents(payload: Dict[str, Any]) -> Dict[str, bool]:
     situation = payload.get("situation", "")
     prefer = payload.get("prefer", "")
-    people = payload.get("people", 0)  # 0이면 "상관없음"
-    blob = f"{situation} {prefer}".strip()
+    people = payload.get("people", 0)
 
+    blob = f"{situation} {prefer}".strip()
     solo = (people == 1) or any_kw(blob, ["혼밥", "혼자", "1인", "1인식사", "혼술"])
     budget = any_kw(blob, ["가성비", "저렴", "싸게", "착한가격", "만원", "만원대"])
     vegan = any_kw(blob, ["비건", "vegan", "채식", "락토", "오보"])
-    diet = any_kw(blob, ["다이어트", "저칼로리", "샐러드", "단백질", "헬시", "건강식"])
-
+    diet = any_kw(blob, ["다이어트", "저탄", "키토", "샐러드", "단백질"])
     return {"solo": solo, "budget": budget, "vegan": vegan, "diet": diet}
 
 
@@ -398,43 +420,43 @@ def score_candidate_for_payload(
     if intents.get("solo"):
         if any_kw(blob, SOLO_HARD_EXCLUDE):
             score -= 999
-            reasons.append("혼밥: 하드 제외 업종/용도(-999)")
+            reasons.append("혼밥: 하드 제외 용도/업종(-999)")
         hits = count_kw_hits(blob, SOLO_STRONG_PENALTY)
         if hits:
             penalty = min(80 * hits, 240)
             score -= penalty
             reasons.append(f"혼밥: 단체/모임 시그널({hits}) 감점(-{penalty})")
+
         pos_hits = count_kw_hits(blob, SOLO_POSITIVE)
         if pos_hits:
             bonus = min(50 * pos_hits, 150)
             score += bonus
             reasons.append(f"혼밥: 1인 친화 시그널({pos_hits}) 가점(+{bonus})")
+
         cat_hits = count_kw_hits(name_cat, SOLO_CATEGORY_PENALTY)
         if cat_hits:
             penalty = min(70 * cat_hits, 210)
             score -= penalty
-            reasons.append(f"혼밥: 업종 패널티({cat_hits}) (-{penalty})")
+            reasons.append(f"혼밥: 업종 패널티({cat_hits})(-{penalty})")
 
     if intents.get("budget"):
         pos = count_kw_hits(blob, BUDGET_POSITIVE)
         if pos:
             bonus = min(35 * pos, 140)
             score += bonus
-            reasons.append(f"가성비: 긍정 시그널({pos}) (+{bonus})")
+            reasons.append(f"가성비: 긍정 시그널({pos})(+{bonus})")
         neg = count_kw_hits(blob, BUDGET_NEGATIVE)
         if neg:
             penalty = min(60 * neg, 180)
             score -= penalty
-            reasons.append(f"가성비: 고가 시그널({neg}) (-{penalty})")
+            reasons.append(f"가성비: 고가 시그널({neg})(-{penalty})")
 
-    if intents.get("vegan"):
-        if any_kw(blob, ["비건", "vegan", "채식", "샐러드"]):
-            score += 30
-            reasons.append("비건: 관련 시그널(+30)")
-    if intents.get("diet"):
-        if any_kw(blob, ["샐러드", "포케", "단백질", "그릭요거트", "저칼로리", "헬시"]):
-            score += 25
-            reasons.append("다이어트: 관련 시그널(+25)")
+    # ✅ 빠른 태그 반영(약~중간)
+    quick_tags = payload.get("quick_tags", []) or []
+    if quick_tags:
+        if any_kw(blob, quick_tags):
+            score += 40
+            reasons.append("빠른 태그 매칭(+40)")
 
     food_types = payload.get("food_type") or []
     if food_types:
@@ -458,7 +480,8 @@ def score_candidate_for_payload(
         if any_kw(blob, ["술", "안주", "호프", "포차"]):
             score += 15 if visit == "저녁" else 0
 
-    score += 10
+    score += 10  # 네이버 후보 기반 신뢰 가점
+
     meta = {"score": score, "score_notes": reasons[:8]}
     return score, meta
 
@@ -466,14 +489,17 @@ def score_candidate_for_payload(
 def solo_gate_filter(sorted_candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     kept = []
     dropped = []
+    penalty_set = [normalize_text(x) for x in SOLO_STRONG_PENALTY]
     for c in sorted_candidates:
         blob = normalize_text(c.get("_signal_blob", ""))
-        if any(k in blob for k in [normalize_text(x) for x in SOLO_STRONG_PENALTY]):
+        if any(k in blob for k in penalty_set):
             dropped.append(c)
         else:
             kept.append(c)
+
     if len(kept) >= 15:
         return kept
+
     dropped = sorted(dropped, key=lambda x: safe_int(x.get("_score", -999999)), reverse=True)
     return kept + dropped[: max(0, 15 - len(kept))]
 
@@ -483,6 +509,7 @@ def solo_gate_filter(sorted_candidates: List[Dict[str, Any]]) -> List[Dict[str, 
 # ===============================
 st.set_page_config(page_title="LunchMate 🍱", layout="wide")
 
+# ✅ 스크롤 잠김 방지 CSS
 st.markdown(
     """
     <style>
@@ -501,19 +528,10 @@ naver_client_id = get_secret("NAVER_CLIENT_ID")
 naver_client_secret = get_secret("NAVER_CLIENT_SECRET")
 openai_api_key = get_secret("OPENAI_API_KEY")
 
-# ✅ session_state 초기화
 if "candidate_cache_key" not in st.session_state:
     st.session_state["candidate_cache_key"] = None
 if "candidates" not in st.session_state:
     st.session_state["candidates"] = []
-if "ui_applied_message" not in st.session_state:
-    st.session_state["ui_applied_message"] = ""
-if "quick_tags" not in st.session_state:
-    st.session_state["quick_tags"] = []
-if "prev_quick_tags" not in st.session_state:
-    st.session_state["prev_quick_tags"] = []
-if "situation_text" not in st.session_state:
-    st.session_state["situation_text"] = ""
 
 
 # ===============================
@@ -531,7 +549,7 @@ start_location = st.sidebar.text_input("출발지(회사/역/주소)", placehold
 
 st.sidebar.header("🔍 검색 조건")
 people_choice = st.sidebar.selectbox("인원 수", PEOPLE_OPTIONS, index=DEFAULT_PEOPLE_INDEX)
-people = 0 if people_choice == "상관없음" else int(people_choice)
+people = parse_people_value(people_choice)
 
 distance = st.sidebar.selectbox("이동 거리", DISTANCE_OPTIONS, index=DEFAULT_DISTANCE_INDEX)
 food_type = st.sidebar.multiselect("음식/카페 종류", FOOD_OPTIONS, default=DEFAULT_FOOD_TYPES)
@@ -539,6 +557,18 @@ food_type = st.sidebar.multiselect("음식/카페 종류", FOOD_OPTIONS, default
 st.sidebar.header("🚫 제외 / ✅ 선호")
 exclude_text = st.sidebar.text_input("제외 조건(쉼표로 구분)", placeholder="예: 매운 음식, 회, 웨이팅")
 prefer_text = st.sidebar.text_input("선호 조건(쉼표로 구분)", placeholder="예: 조용한 곳, 가성비, 디저트")
+
+st.sidebar.header("🧩 빠른 태그(복수 선택 가능)")
+QUICK_TAGS = [
+    "혼밥", "조용한", "가성비", "웨이팅 적은", "매운 음식",
+    "데이트", "단체 가능", "포장/테이크아웃",
+    "다이어트", "비건", "샐러드", "디저트", "브런치",
+    "야식", "술/안주", "카공",
+]
+quick_tags = st.sidebar.multiselect("원하는 키워드를 선택하세요", QUICK_TAGS, default=[])
+
+if quick_tags:
+    st.sidebar.success(f"선택됨: {', '.join(quick_tags)}")
 
 st.sidebar.header("🖼️ 후기/사진 설정")
 show_reviews = st.sidebar.checkbox("블로그 후기 표시", value=True)
@@ -551,56 +581,21 @@ debug_mode = st.sidebar.checkbox("🧪 디버그(후보 점수/필터 보기)", 
 
 
 # ===============================
-# 메인 입력
+# 메인 입력 (빠른 입력 버튼 제거!)
 # ===============================
 st.subheader("📝 희망 조건을 자유롭게 입력해 주세요")
-
 situation = st.text_area(
-    "자연스럽게 입력해 주세요(취향, 방문 지역, 상황 등)",
-    placeholder="예: 별내동에서 혼밥하기 좋은 가성비 맛집 추천해줘 / 카공하기 좋은 카페 추천해줘",
-    key="situation_text",
+    "자유롭게 입력해 주세요(취향, 방문 지역, 상황 등)",
+    placeholder="예: 신촌역에서 친구와 점심 먹을거야. 중식 음식점 추천해줘. / 잠실에서 카공하기 좋은 카페 찾아줘",
 )
-
-st.markdown("#### 🧩 빠른 태그(복수 선택 가능)")
-quick_tag_options = [
-    "빨리 이용", "혼밥", "모임/회식", "조용한 곳", "가성비", "데이트",
-    "해장", "술/안주", "카페", "디저트",
-    "다이어트", "비건", "글루텐프리", "매운맛", "안매운맛",
-    "노키즈/조용", "반려동물", "테이크아웃", "포장",
-]
-
-def on_quick_tags_change():
-    cur = st.session_state.get("quick_tags_multiselect", [])
-    prev = st.session_state.get("prev_quick_tags", [])
-    st.session_state["quick_tags"] = cur
-    st.session_state["prev_quick_tags"] = cur
-
-    added = [x for x in cur if x not in prev]
-    removed = [x for x in prev if x not in cur]
-
-    if added and not removed:
-        st.session_state["ui_applied_message"] = f"✅ 태그 적용: {', '.join(added)}"
-    elif removed and not added:
-        st.session_state["ui_applied_message"] = f"✅ 태그 해제: {', '.join(removed)}"
-    elif added and removed:
-        st.session_state["ui_applied_message"] = f"✅ 태그 변경 (추가: {', '.join(added)} / 해제: {', '.join(removed)})"
-    else:
-        st.session_state["ui_applied_message"] = "✅ 태그가 적용되었습니다."
-
-selected_quick_tags = st.multiselect(
-    "원하는 키워드를 선택하세요",
-    quick_tag_options,
-    default=st.session_state.get("quick_tags", []),
-    key="quick_tags_multiselect",
-    on_change=on_quick_tags_change,
-)
-
-render_chips(st.session_state.get("quick_tags", []))
-
-if st.session_state.get("ui_applied_message"):
-    st.success(st.session_state["ui_applied_message"])
 
 st.write("")
+
+
+def require_secrets_or_stop():
+    if not (naver_client_id and naver_client_secret and openai_api_key):
+        st.error("서비스 설정 오류가 발생했습니다. 잠시 후 다시 시도해 주세요.")
+        st.stop()
 
 
 def generate_queries(client: OpenAI, payload: Dict[str, Any]) -> List[str]:
@@ -626,13 +621,17 @@ def generate_queries(client: OpenAI, payload: Dict[str, Any]) -> List[str]:
         "상관없음": "맛집/카페",
     }.get(visit, "맛집/카페")
 
+    qt = payload.get("quick_tags") or []
+    qt_str = ", ".join(qt) if qt else "(없음)"
+
     user_query = (
         f"추천 종류: {visit} ({visit_hint})\n"
         f"출발지: {payload.get('start_location') or '(미입력)'}\n"
         f"상황: {payload.get('situation')}\n"
-        f"인원: {payload.get('people') if payload.get('people') else '상관없음'}\n"
+        f"인원: {payload.get('people') or '상관없음'}\n"
         f"이동거리 선호: {payload.get('distance_pref')}\n"
         f"선호 음식/카페 종류: {food_str}\n"
+        f"빠른 태그: {qt_str}\n"
         f"제외 조건: {payload.get('exclude') or '(없음)'}\n"
         f"선호 조건: {payload.get('prefer') or '(없음)'}\n\n"
         "네이버 지역검색에 넣을 queries 3~6개를 만들어줘."
@@ -730,13 +729,13 @@ def recommend_from_candidates(
     must_notes = []
     if intents.get("solo"):
         must_notes.append("- 사용자가 혼밥/1인식사를 원한다. 단체/회식/모임 중심 장소는 우선 배제하라.")
-        must_notes.append("- 바자리/카운터/1인식사 키워드가 있거나 혼자 먹기 편한 형태를 우선하라.")
+        must_notes.append("- 바자리/카운터/1인식사 힌트가 있거나 혼자 먹기 편한 형태를 우선하라.")
     if intents.get("budget"):
         must_notes.append("- 사용자가 가성비/저렴을 원한다. '오마카세/파인다이닝/고급/코스' 느낌은 배제하라.")
     if intents.get("vegan"):
-        must_notes.append("- 사용자가 비건/채식 지향이다. 채식/비건 옵션 가능성이 낮으면 우선순위를 낮춰라.")
+        must_notes.append("- 사용자가 비건/채식을 원한다. 고기 중심 식당은 배제하고 채식 선택지가 있는 후보를 우선하라.")
     if intents.get("diet"):
-        must_notes.append("- 사용자가 다이어트/헬시를 원한다. 튀김/과식 유도/고열량 위주는 우선순위를 낮춰라.")
+        must_notes.append("- 사용자가 다이어트를 원한다. 샐러드/단백질/저탄수 옵션이 가능한 후보를 우선하라.")
 
     must_notes_text = "\n".join(must_notes) if must_notes else "- 사용자 조건에 가장 부합하는 후보를 우선하라."
 
@@ -754,7 +753,7 @@ def recommend_from_candidates(
         "      \"rank\": 1,\n"
         "      \"name\": \"...\",\n"
         "      \"reason\": \"...\",\n"
-        "      \"tags\": [\"#가성비\", \"#혼밥\", \"#조용함\"],\n"
+        "      \"tags\": [\"#가성비\", \"#혼밥\", \"#조용한\"],\n"
         "      \"address\": \"...\",\n"
         "      \"category\": \"...\",\n"
         "      \"link\": \"...\"\n"
@@ -783,6 +782,7 @@ def recommend_from_candidates(
         "people": payload.get("people", 0),
         "distance_pref": payload.get("distance_pref", ""),
         "food_type": payload.get("food_type", []),
+        "quick_tags": payload.get("quick_tags", []),
         "exclude": payload.get("exclude", ""),
         "prefer": payload.get("prefer", ""),
         "top_k": TOP_K,
@@ -806,28 +806,23 @@ with btn2:
 # 실행
 # ===============================
 if run_search or reroll:
-    if not (st.session_state.get("situation_text") or "").strip():
+    if not situation.strip():
         st.warning("상황을 입력해 주세요.")
         st.stop()
 
-    if not (naver_client_id and naver_client_secret and openai_api_key):
-        st.error("서비스 설정 오류가 발생했습니다. 잠시 후 다시 시도해 주세요.")
-        st.stop()
-
+    require_secrets_or_stop()
     client = OpenAI(api_key=openai_api_key)
-
-    # ✅ 멀티 태그를 prefer에 자동 반영
-    prefer_merged = merge_prefer((prefer_text or "").strip(), st.session_state.get("quick_tags", []))
 
     payload = {
         "visit_type": visit_type,
-        "start_location": (start_location or "").strip(),
-        "situation": (st.session_state.get("situation_text") or "").strip(),
+        "start_location": start_location.strip(),
+        "situation": situation.strip(),
         "people": people,  # 0이면 상관없음
         "distance_pref": distance,
         "food_type": food_type,
-        "exclude": (exclude_text or "").strip(),
-        "prefer": prefer_merged,
+        "quick_tags": quick_tags,
+        "exclude": exclude_text.strip(),
+        "prefer": prefer_text.strip(),
         "blog_sort": blog_sort_param,
     }
     cache_key = build_cache_key(payload)
@@ -868,6 +863,7 @@ if run_search or reroll:
     with st.spinner("후보를 정교하게 선별하는 중..."):
         scored_candidates = score_and_prepare_candidates(payload, candidates, blog_sort_param)
 
+    # (검증: 후보 보기)
     with st.expander("🔎 이번 추천에 사용된 후보 정보(검증)"):
         st.write(f"- 후보 수(원본): **{len(candidates)}개**")
         st.write(f"- 후보 수(스코어링/필터 후): **{len(scored_candidates)}개**")
@@ -905,30 +901,54 @@ if run_search or reroll:
 
     for r in recommendations:
         name = r.get("name", "이름 없음")
-        address = r.get("address", "") or "정보 없음"
+        address = r.get("address", "") or ""
         category = r.get("category", "") or "정보 없음"
         reason = r.get("reason", "")
         tags = r.get("tags", [])
 
-        with st.container():
-            left, right = st.columns([3, 2])
+        # ✅ 이미지 검색: 매장명 + 주소 힌트(앞 1~2토큰)
+        addr_hint = " ".join(address.split()[:2]).strip()
+        img_query = f"{name} {addr_hint}".strip()
 
-            with left:
+        img_items = []
+        try:
+            img_items = naver_image_search_cached(
+                img_query, naver_client_id, naver_client_secret,
+                display=IMAGE_PER_PLACE, sort="sim"
+            )
+        except Exception:
+            img_items = []
+
+        with st.container():
+            img_col, info_col = st.columns([1, 2])
+
+            with img_col:
+                if img_items:
+                    thumb = img_items[0].get("thumbnail")
+                    if thumb:
+                        st.image(thumb, use_container_width=True)
+                        # 출처 확인용(원하면 유지, 싫으면 제거 가능)
+                        src = img_items[0].get("link")
+                        if src:
+                            st.link_button("이미지 출처", src)
+                else:
+                    st.caption("이미지를 찾지 못했어요.")
+
+            with info_col:
                 st.markdown(f"### {r.get('rank', '')}️⃣ {name}")
                 if tags and isinstance(tags, list):
                     tag_line = " ".join([t if str(t).startswith("#") else f"#{t}" for t in tags[:10]])
                     st.caption(tag_line)
                 st.write(f"📌 **추천 이유**: {reason}")
                 st.write(f"🏷️ **카테고리**: {category}")
-                st.write(f"📍 **주소**: {address}")
+                st.write(f"📍 **주소**: {address or '정보 없음'}")
 
-            with right:
                 st.link_button("🗺️ 네이버 지도에서 보기", naver_map_search_url(name, address))
                 if r.get("link"):
                     st.link_button("🔗 네이버/예약 링크", r["link"])
 
             if show_reviews:
-                q = make_review_query(name, r.get("address", ""))
+                q = make_review_query(name, address)
                 with st.expander("🖼️ 블로그 후기 보기"):
                     st.caption(f"검색어: {q} | 정렬: {blog_sort}")
                     try:
@@ -945,14 +965,9 @@ if run_search or reroll:
                         st.write("관련 블로그 후기를 찾지 못했어요.")
                     else:
                         for p in blog_posts[:review_display]:
-                            cols = st.columns([1, 3])
-                            with cols[0]:
-                                if p.get("thumbnail"):
-                                    st.image(p["thumbnail"], use_container_width=True)
-                            with cols[1]:
-                                st.markdown(f"- [{p['title']}]({p['link']})")
-                                if p.get("desc"):
-                                    st.caption(p["desc"])
+                            st.markdown(f"- [{p['title']}]({p['link']})")
+                            if p.get("desc"):
+                                st.caption(p["desc"])
 
             st.divider()
 
