@@ -2,7 +2,7 @@ import json
 import re
 import time
 import html
-from typing import List, Dict, Any, Tuple, Optional
+from typing import List, Dict, Any, Tuple
 from urllib.parse import quote_plus
 
 import requests
@@ -42,7 +42,7 @@ BLOG_PER_PLACE_FOR_SCORING = 3
 LLM_RERANK_POOL = 25
 
 # ✅ 결과 카드 이미지(이미지 검색 API)
-IMAGE_PER_PLACE = 1  # 1~5 (네이버 이미지 API display 제한에 맞춰 5 이하로 유지)
+IMAGE_PER_PLACE = 1  # 1~5
 
 
 # ===============================
@@ -153,9 +153,7 @@ def dedupe_candidates(candidates: List[Dict[str, str]]) -> List[Dict[str, str]]:
 
 
 def filter_candidates(candidates: List[Dict[str, str]]) -> List[Dict[str, str]]:
-    """
-    음식점/카페 추천 서비스 기준으로, 명백히 비식음료 업종만 제거
-    """
+    """음식점/카페 추천 서비스 기준으로, 명백히 비식음료 업종만 제거"""
     bad_keywords = [
         "학원", "공인중개", "부동산", "미용", "네일", "피부", "성형",
         "헬스", "요가", "필라테스", "세탁", "수리", "정비", "렌탈",
@@ -223,11 +221,7 @@ def ensure_k_recommendations(
     candidates: List[Dict[str, Any]],
     k: int,
 ) -> List[Dict[str, Any]]:
-    """
-    추천 결과가 k개 미만이면 candidates에서 부족분을 채워 k개로 맞춤
-    - 중복(이름+주소) 제거
-    - rank 1~k 재정렬
-    """
+    """추천 결과가 k개 미만이면 candidates에서 부족분을 채워 k개로 맞춤"""
     def _key(name: str, address: str) -> tuple:
         return (str(name or "").strip(), str(address or "").strip())
 
@@ -320,8 +314,6 @@ def naver_image_search_cached(
     """
     네이버 이미지 검색 API
     https://openapi.naver.com/v1/search/image
-    - items[].thumbnail : 섬네일 URL
-    - items[].link      : 원본 이미지 URL
     """
     url = "https://openapi.naver.com/v1/search/image"
     headers = {
@@ -333,7 +325,7 @@ def naver_image_search_cached(
         "display": max(1, min(display, 5)),
         "start": 1,
         "sort": sort,        # sim/date
-        "filter": "all",     # all/large/medium/small
+        "filter": "all",
     }
     r = requests.get(url, headers=headers, params=params, timeout=10)
     r.raise_for_status()
@@ -451,7 +443,6 @@ def score_candidate_for_payload(
             score -= penalty
             reasons.append(f"가성비: 고가 시그널({neg})(-{penalty})")
 
-    # ✅ 빠른 태그 반영(약~중간)
     quick_tags = payload.get("quick_tags", []) or []
     if quick_tags:
         if any_kw(blob, quick_tags):
@@ -472,16 +463,8 @@ def score_candidate_for_payload(
         else:
             score -= 20
             reasons.append("방문목적(카페/디저트) 불일치(-20)")
-    elif visit in ["아침", "점심", "저녁"]:
-        if any_kw(blob, ["브런치", "아침"]):
-            score += 15 if visit == "아침" else 0
-        if any_kw(blob, ["점심특선", "런치"]):
-            score += 15 if visit == "점심" else 0
-        if any_kw(blob, ["술", "안주", "호프", "포차"]):
-            score += 15 if visit == "저녁" else 0
 
-    score += 10  # 네이버 후보 기반 신뢰 가점
-
+    score += 10
     meta = {"score": score, "score_notes": reasons[:8]}
     return score, meta
 
@@ -509,7 +492,6 @@ def solo_gate_filter(sorted_candidates: List[Dict[str, Any]]) -> List[Dict[str, 
 # ===============================
 st.set_page_config(page_title="LunchMate 🍱", layout="wide")
 
-# ✅ 스크롤 잠김 방지 CSS
 st.markdown(
     """
     <style>
@@ -532,10 +514,12 @@ if "candidate_cache_key" not in st.session_state:
     st.session_state["candidate_cache_key"] = None
 if "candidates" not in st.session_state:
     st.session_state["candidates"] = []
+if "quick_tags_main" not in st.session_state:
+    st.session_state["quick_tags_main"] = []
 
 
 # ===============================
-# 사이드바
+# 사이드바 (빠른 태그 제거!)
 # ===============================
 st.sidebar.header("🕒 매장 방문 목적")
 visit_type = st.sidebar.selectbox(
@@ -550,25 +534,12 @@ start_location = st.sidebar.text_input("출발지(회사/역/주소)", placehold
 st.sidebar.header("🔍 검색 조건")
 people_choice = st.sidebar.selectbox("인원 수", PEOPLE_OPTIONS, index=DEFAULT_PEOPLE_INDEX)
 people = parse_people_value(people_choice)
-
 distance = st.sidebar.selectbox("이동 거리", DISTANCE_OPTIONS, index=DEFAULT_DISTANCE_INDEX)
 food_type = st.sidebar.multiselect("음식/카페 종류", FOOD_OPTIONS, default=DEFAULT_FOOD_TYPES)
 
 st.sidebar.header("🚫 제외 / ✅ 선호")
 exclude_text = st.sidebar.text_input("제외 조건(쉼표로 구분)", placeholder="예: 매운 음식, 회, 웨이팅")
 prefer_text = st.sidebar.text_input("선호 조건(쉼표로 구분)", placeholder="예: 조용한 곳, 가성비, 디저트")
-
-st.sidebar.header("🧩 빠른 태그(복수 선택 가능)")
-QUICK_TAGS = [
-    "혼밥", "조용한", "가성비", "웨이팅 적은", "매운 음식",
-    "데이트", "단체 가능", "포장/테이크아웃",
-    "다이어트", "비건", "샐러드", "디저트", "브런치",
-    "야식", "술/안주", "카공",
-]
-quick_tags = st.sidebar.multiselect("원하는 키워드를 선택하세요", QUICK_TAGS, default=[])
-
-if quick_tags:
-    st.sidebar.success(f"선택됨: {', '.join(quick_tags)}")
 
 st.sidebar.header("🖼️ 후기/사진 설정")
 show_reviews = st.sidebar.checkbox("블로그 후기 표시", value=True)
@@ -581,13 +552,35 @@ debug_mode = st.sidebar.checkbox("🧪 디버그(후보 점수/필터 보기)", 
 
 
 # ===============================
-# 메인 입력 (빠른 입력 버튼 제거!)
+# 메인 입력
 # ===============================
 st.subheader("📝 희망 조건을 자유롭게 입력해 주세요")
 situation = st.text_area(
-    "자유롭게 입력해 주세요(취향, 방문 지역, 상황 등)",
-    placeholder="예: 신촌역에서 친구와 점심 먹을거야. 중식 음식점 추천해줘. / 잠실에서 카공하기 좋은 카페 찾아줘",
+    "자연스럽게 입력해 주세요(취향, 방문 지역, 상황 등)",
+    placeholder="예: 별내동에서 혼밥하기 좋은 가성비 맛집 추천해줘 / 잠실에서 카공하기 좋은 카페 찾아줘",
 )
+
+# ✅ 빠른 태그: 프롬프트 입력란 아래로 이동
+st.markdown("### 🧩 빠른 태그(복수 선택 가능)")
+QUICK_TAGS = [
+    "혼밥", "조용한", "가성비", "웨이팅 적은", "매운 음식",
+    "데이트", "단체 가능", "포장/테이크아웃",
+    "다이어트", "비건", "샐러드", "디저트", "브런치",
+    "야식", "술/안주", "카공",
+]
+
+quick_tags = st.multiselect(
+    "원하는 키워드를 선택하세요",
+    QUICK_TAGS,
+    default=st.session_state.get("quick_tags_main", []),
+    key="quick_tags_main",
+)
+
+# ✅ 적용되었다는 표시(사용자 가시성 강화)
+if quick_tags:
+    st.success(f"✅ 빠른 태그 적용됨: {', '.join(quick_tags)}")
+else:
+    st.caption("선택한 빠른 태그가 없어요. 필요하면 위에서 골라주세요.")
 
 st.write("")
 
@@ -792,6 +785,13 @@ def recommend_from_candidates(
     return llm_json(client, system_rec, user_rec)
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def naver_image_search_cached_for_place(name: str, address: str, client_id: str, client_secret: str) -> List[Dict[str, Any]]:
+    addr_hint = " ".join((address or "").split()[:2]).strip()
+    q = f"{name} {addr_hint}".strip()
+    return naver_image_search_cached(q, client_id, client_secret, display=IMAGE_PER_PLACE, sort="sim")
+
+
 # ===============================
 # 버튼 (UX: 재추천)
 # ===============================
@@ -810,7 +810,10 @@ if run_search or reroll:
         st.warning("상황을 입력해 주세요.")
         st.stop()
 
-    require_secrets_or_stop()
+    if not (naver_client_id and naver_client_secret and openai_api_key):
+        st.error("서비스 설정 오류가 발생했습니다. 잠시 후 다시 시도해 주세요.")
+        st.stop()
+
     client = OpenAI(api_key=openai_api_key)
 
     payload = {
@@ -820,7 +823,7 @@ if run_search or reroll:
         "people": people,  # 0이면 상관없음
         "distance_pref": distance,
         "food_type": food_type,
-        "quick_tags": quick_tags,
+        "quick_tags": quick_tags,  # ✅ 메인에서 선택된 태그가 들어감
         "exclude": exclude_text.strip(),
         "prefer": prefer_text.strip(),
         "blog_sort": blog_sort_param,
@@ -863,7 +866,6 @@ if run_search or reroll:
     with st.spinner("후보를 정교하게 선별하는 중..."):
         scored_candidates = score_and_prepare_candidates(payload, candidates, blog_sort_param)
 
-    # (검증: 후보 보기)
     with st.expander("🔎 이번 추천에 사용된 후보 정보(검증)"):
         st.write(f"- 후보 수(원본): **{len(candidates)}개**")
         st.write(f"- 후보 수(스코어링/필터 후): **{len(scored_candidates)}개**")
@@ -906,16 +908,9 @@ if run_search or reroll:
         reason = r.get("reason", "")
         tags = r.get("tags", [])
 
-        # ✅ 이미지 검색: 매장명 + 주소 힌트(앞 1~2토큰)
-        addr_hint = " ".join(address.split()[:2]).strip()
-        img_query = f"{name} {addr_hint}".strip()
-
-        img_items = []
+        # 이미지(네이버 이미지 검색)
         try:
-            img_items = naver_image_search_cached(
-                img_query, naver_client_id, naver_client_secret,
-                display=IMAGE_PER_PLACE, sort="sim"
-            )
+            img_items = naver_image_search_cached_for_place(name, address, naver_client_id, naver_client_secret)
         except Exception:
             img_items = []
 
@@ -927,7 +922,6 @@ if run_search or reroll:
                     thumb = img_items[0].get("thumbnail")
                     if thumb:
                         st.image(thumb, use_container_width=True)
-                        # 출처 확인용(원하면 유지, 싫으면 제거 가능)
                         src = img_items[0].get("link")
                         if src:
                             st.link_button("이미지 출처", src)
