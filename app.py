@@ -41,9 +41,6 @@ BLOG_PER_PLACE_FOR_SCORING = 3
 # 스코어링 이후 LLM에 넘길 후보 수
 LLM_RERANK_POOL = 25
 
-# ✅ 결과 카드 이미지(블로그 썸네일 우선 + 이미지 검색 API fallback)
-IMAGE_PER_PLACE = 5  # 1~5 (네이버 이미지 API display 제한에 맞춰 5 이하로 유지)
-
 
 # ===============================
 # 유틸
@@ -100,30 +97,6 @@ def parse_people_value(choice: str) -> int:
     return int(m.group(1)) if m else 0
 
 
-def normalize_place_name(name: str) -> str:
-    """
-    상호명 정규화: 공백/특수문자 제거 + 소문자
-    (이미지 결과 title/link에서 포함 여부 체크용)
-    """
-    n = normalize_text(name)
-    n = re.sub(r"[^0-9a-z가-힣]", "", n)
-    return n
-
-
-def address_hint_tokens(address: str, max_tokens: int = 6) -> List[str]:
-    """
-    주소 힌트를 토큰으로 분리 (1~6 토큰 정도가 현실적으로 잘 먹힘)
-    """
-    addr = (address or "").strip()
-    if not addr:
-        return []
-    toks = [t for t in addr.split() if t]
-    return toks[:max_tokens]
-
-
-# ===============================
-# 네이버 API
-# ===============================
 def naver_local_search(
     query: str,
     client_id: str,
@@ -162,78 +135,6 @@ def naver_local_search(
             }
         )
     return results
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def naver_blog_search_cached(
-    query: str,
-    client_id: str,
-    client_secret: str,
-    display: int = 3,
-    sort: str = "sim",
-):
-    """
-    네이버 블로그 검색 API
-    - items[].thumbnail (있을 수도/없을 수도)
-    """
-    url = "https://openapi.naver.com/v1/search/blog.json"
-    headers = {
-        "X-Naver-Client-Id": client_id,
-        "X-Naver-Client-Secret": client_secret,
-    }
-    params = {
-        "query": query,
-        "display": max(1, min(display, 5)),
-        "start": 1,
-        "sort": sort,
-    }
-    r = requests.get(url, headers=headers, params=params, timeout=10)
-    r.raise_for_status()
-    data = r.json()
-
-    items = []
-    for it in data.get("items", []):
-        items.append({
-            "title": strip_b_tags(html.unescape(it.get("title", ""))),
-            "link": it.get("link", ""),
-            "desc": strip_b_tags(html.unescape(it.get("description", ""))),
-            "thumbnail": it.get("thumbnail", ""),  # ✅ 썸네일 사용
-        })
-    return items
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def naver_image_search_cached(
-    query: str,
-    client_id: str,
-    client_secret: str,
-    display: int = 5,
-    sort: str = "sim",
-    img_filter: str = "large",
-):
-    """
-    네이버 이미지 검색 API
-    https://openapi.naver.com/v1/search/image
-    - items[].thumbnail : 섬네일 URL
-    - items[].link      : 원본 이미지 URL
-    - items[].title     : HTML 포함 제목
-    """
-    url = "https://openapi.naver.com/v1/search/image"
-    headers = {
-        "X-Naver-Client-Id": client_id,
-        "X-Naver-Client-Secret": client_secret,
-    }
-    params = {
-        "query": query,
-        "display": max(1, min(display, 5)),
-        "start": 1,
-        "sort": sort,              # sim/date
-        "filter": img_filter,      # all/large/medium/small
-    }
-    r = requests.get(url, headers=headers, params=params, timeout=10)
-    r.raise_for_status()
-    data = r.json()
-    return data.get("items", [])
 
 
 def dedupe_candidates(candidates: List[Dict[str, str]]) -> List[Dict[str, str]]:
@@ -372,6 +273,44 @@ def make_review_query(name: str, address: str) -> str:
     return re.sub(r"\s+", " ", q)
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def naver_blog_search_cached(
+    query: str,
+    client_id: str,
+    client_secret: str,
+    display: int = 3,
+    sort: str = "sim",
+):
+    """
+    네이버 블로그 검색 API
+    - items[].thumbnail : 썸네일 URL (있을 수도/없을 수도)
+    """
+    url = "https://openapi.naver.com/v1/search/blog.json"
+    headers = {
+        "X-Naver-Client-Id": client_id,
+        "X-Naver-Client-Secret": client_secret,
+    }
+    params = {
+        "query": query,
+        "display": max(1, min(display, 5)),
+        "start": 1,
+        "sort": sort,
+    }
+    r = requests.get(url, headers=headers, params=params, timeout=10)
+    r.raise_for_status()
+    data = r.json()
+
+    items = []
+    for it in data.get("items", []):
+        items.append({
+            "title": strip_b_tags(html.unescape(it.get("title", ""))),
+            "link": it.get("link", ""),
+            "desc": strip_b_tags(html.unescape(it.get("description", ""))),
+            "thumbnail": it.get("thumbnail", ""),  # ✅ 링크 옆에 붙일 썸네일
+        })
+    return items
+
+
 def naver_map_search_url(place_name: str, address: str = "") -> str:
     q = (place_name or "").strip()
     if address:
@@ -393,176 +332,6 @@ def build_cache_key(payload: Dict[str, Any]) -> str:
         "quick_tags": payload.get("quick_tags", []),
     }
     return json.dumps(compact, ensure_ascii=False, sort_keys=True)
-
-
-# ===============================
-# 이미지 개선: 쿼리 생성 + 필터링 + 블로그 썸네일 우선 fallback
-# ===============================
-IMAGE_NOISE_KW = [
-    "지도", "약도", "로고", "포스터", "배너", "쿠폰", "가격표", "메뉴판", "영업시간",
-    "이벤트", "광고", "프로필", "캐릭터", "일러스트", "연예인", "짤", "밈"
-]
-IMAGE_POSITIVE_KW = [
-    "간판", "외관", "내부", "매장", "입구", "테이블", "좌석", "홀", "룸",
-    "음식", "메뉴", "디저트", "커피"
-]
-
-
-def build_place_image_queries(name: str, address: str, category: str = "") -> List[str]:
-    """
-    ✅ ‘가게-특정’ 이미지 검색어 생성
-    - 주소 힌트를 4~6토큰으로 강화
-    - 외관/내부/간판 등 키워드를 섞어서 오탐을 줄임
-    """
-    name = (name or "").strip()
-    addr_tokens = address_hint_tokens(address, max_tokens=6)
-    addr_hint = " ".join(addr_tokens).strip()
-
-    base = f"{name} {addr_hint}".strip() if addr_hint else name
-    # category를 살짝 힌트로 쓰되 과하게 붙이지 않기 (동명이인 업종 구분)
-    cat_hint = ""
-    if category:
-        cat_hint = category.split(">")[-1].strip()  # 네이버 카테고리 "A>B>C" 마지막 토큰
-
-    queries = [
-        base,
-        f"{base} 간판",
-        f"{base} 외관",
-        f"{base} 내부",
-    ]
-    if cat_hint:
-        queries.append(f"{name} {addr_hint} {cat_hint}".strip())
-    # 중복 제거
-    out = []
-    seen = set()
-    for q in queries:
-        q = re.sub(r"\s+", " ", (q or "").strip())
-        if not q or q in seen:
-            continue
-        seen.add(q)
-        out.append(q)
-    return out
-
-
-def score_image_item(item: Dict[str, Any], place_name: str, address: str) -> int:
-    """
-    ✅ 이미지 결과 필터링/스코어링
-    - 상호명 포함 여부, 주소 힌트 포함 여부 가점
-    - 로고/지도/메뉴판 등 잡음 키워드 감점
-    """
-    score = 0
-    pn = normalize_place_name(place_name)
-    addr_toks = [normalize_text(t) for t in address_hint_tokens(address, max_tokens=6)]
-
-    title = strip_b_tags(html.unescape(item.get("title", "") or ""))
-    title_n = normalize_text(title)
-    title_compact = re.sub(r"[^0-9a-z가-힣]", "", title_n)
-
-    link = (item.get("link", "") or "")
-    thumb = (item.get("thumbnail", "") or "")
-    link_n = normalize_text(link)
-    thumb_n = normalize_text(thumb)
-
-    # 상호명 포함 (title/link/thumbnail 어디든)
-    if pn and pn in title_compact:
-        score += 80
-    if pn and pn in re.sub(r"[^0-9a-z가-힣]", "", link_n):
-        score += 60
-    if pn and pn in re.sub(r"[^0-9a-z가-힣]", "", thumb_n):
-        score += 40
-
-    # 주소 힌트 일부 포함
-    hit_addr = 0
-    for t in addr_toks:
-        if t and (t in title_n or t in link_n):
-            hit_addr += 1
-    score += min(hit_addr * 15, 45)
-
-    # 긍정 키워드
-    pos_hits = count_kw_hits(title, IMAGE_POSITIVE_KW)
-    score += min(pos_hits * 12, 36)
-
-    # 잡음 키워드 감점
-    neg_hits = count_kw_hits(title, IMAGE_NOISE_KW)
-    score -= min(neg_hits * 25, 100)
-
-    # 최소한 thumbnail/link가 있어야 유효
-    if not item.get("thumbnail"):
-        score -= 50
-    return score
-
-
-def pick_best_image(items: List[Dict[str, Any]], place_name: str, address: str) -> Optional[Dict[str, Any]]:
-    if not items:
-        return None
-    scored = []
-    for it in items:
-        s = score_image_item(it, place_name, address)
-        scored.append((s, it))
-    scored.sort(key=lambda x: x[0], reverse=True)
-    best_score, best_item = scored[0]
-    # 너무 낮으면(거의 랜덤) 버림
-    if best_score < 10:
-        return None
-    return best_item
-
-
-def get_best_place_image(
-    place_name: str,
-    address: str,
-    category: str,
-    naver_client_id: str,
-    naver_client_secret: str,
-    blog_sort_param: str = "sim",
-) -> Tuple[Optional[str], Optional[str], str]:
-    """
-    ✅ 이미지 최종 선택
-    1) 블로그 검색 결과 thumbnail이 있으면 그걸 1순위로 사용
-    2) 없으면 이미지 검색 API로 여러 쿼리/여러 장 수집 후 필터링해서 1장 선택
-    return: (image_url, source_url, source_type)
-    - image_url: 화면에 표시할 URL (thumbnail 우선)
-    - source_url: 출처 링크(블로그 글 링크 or 원본 이미지 링크)
-    - source_type: "blog" | "image" | "none"
-    """
-    # 1) 블로그 thumbnail 우선
-    blog_q = make_review_query(place_name, address)
-    try:
-        posts = naver_blog_search_cached(
-            blog_q, naver_client_id, naver_client_secret,
-            display=5, sort=blog_sort_param
-        )
-        for p in posts:
-            thumb = (p.get("thumbnail") or "").strip()
-            if thumb:
-                return thumb, p.get("link", ""), "blog"
-    except Exception:
-        pass
-
-    # 2) 이미지 검색 fallback (쿼리 여러 개 + display=5)
-    queries = build_place_image_queries(place_name, address, category)
-    collected: List[Dict[str, Any]] = []
-    seen_thumb = set()
-
-    for q in queries[:4]:  # 과도한 호출 방지
-        try:
-            items = naver_image_search_cached(
-                q, naver_client_id, naver_client_secret,
-                display=IMAGE_PER_PLACE, sort="sim", img_filter="large"
-            )
-        except Exception:
-            items = []
-        for it in items:
-            th = (it.get("thumbnail") or "").strip()
-            if not th or th in seen_thumb:
-                continue
-            seen_thumb.add(th)
-            collected.append(it)
-
-    best = pick_best_image(collected, place_name, address)
-    if not best:
-        return None, None, "none"
-
-    return best.get("thumbnail"), best.get("link"), "image"
 
 
 # ===============================
@@ -762,7 +531,7 @@ st.sidebar.header("🚫 제외 / ✅ 선호")
 exclude_text = st.sidebar.text_input("제외 조건(쉼표로 구분)", placeholder="예: 매운 음식, 회, 웨이팅")
 prefer_text = st.sidebar.text_input("선호 조건(쉼표로 구분)", placeholder="예: 조용한 곳, 가성비, 디저트")
 
-st.sidebar.header("🖼️ 후기/사진 설정")
+st.sidebar.header("🖼️ 후기 설정")
 show_reviews = st.sidebar.checkbox("블로그 후기 표시", value=True)
 review_display = st.sidebar.slider("장소당 블로그 후기 개수", 1, 3, 2)
 blog_sort = st.sidebar.radio("후기 정렬", ["연관도(추천)", "최신순"], index=0)
@@ -1033,7 +802,7 @@ if run_search or reroll:
         "people": people,  # 0이면 상관없음
         "distance_pref": distance,
         "food_type": food_type,
-        "quick_tags": quick_tags,  # ✅ 메인 입력 아래 선택
+        "quick_tags": quick_tags,  # ✅ 메인 입력 아래에서 선택된 값
         "exclude": exclude_text.strip(),
         "prefer": prefer_text.strip(),
         "blog_sort": blog_sort_param,
@@ -1119,43 +888,21 @@ if run_search or reroll:
         reason = r.get("reason", "")
         tags = r.get("tags", [])
 
-        # ✅ 이미지: 블로그 썸네일 우선 -> 이미지 검색 fallback(필터링 적용)
-        img_url, img_src, img_src_type = get_best_place_image(
-            place_name=name,
-            address=address,
-            category=category,
-            naver_client_id=naver_client_id,
-            naver_client_secret=naver_client_secret,
-            blog_sort_param=blog_sort_param,
-        )
-
         with st.container():
-            img_col, info_col = st.columns([1, 2])
+            st.markdown(f"### {r.get('rank', '')}️⃣ {name}")
+            if tags and isinstance(tags, list):
+                tag_line = " ".join([t if str(t).startswith("#") else f"#{t}" for t in tags[:10]])
+                st.caption(tag_line)
 
-            with img_col:
-                if img_url:
-                    st.image(img_url, use_container_width=True)
-                    if img_src:
-                        label = "이미지 출처(블로그)" if img_src_type == "blog" else "이미지 출처(검색)"
-                        st.link_button(label, img_src)
-                else:
-                    st.caption("이미지를 찾지 못했어요.")
+            st.write(f"📌 **추천 이유**: {reason}")
+            st.write(f"🏷️ **카테고리**: {category}")
+            st.write(f"📍 **주소**: {address or '정보 없음'}")
 
-                st.caption("※ 이미지는 검색 결과 기반으로, 일부 부정확할 수 있어요.")
+            st.link_button("🗺️ 네이버 지도에서 보기", naver_map_search_url(name, address))
+            if r.get("link"):
+                st.link_button("🔗 네이버/예약 링크", r["link"])
 
-            with info_col:
-                st.markdown(f"### {r.get('rank', '')}️⃣ {name}")
-                if tags and isinstance(tags, list):
-                    tag_line = " ".join([t if str(t).startswith("#") else f"#{t}" for t in tags[:10]])
-                    st.caption(tag_line)
-                st.write(f"📌 **추천 이유**: {reason}")
-                st.write(f"🏷️ **카테고리**: {category}")
-                st.write(f"📍 **주소**: {address or '정보 없음'}")
-
-                st.link_button("🗺️ 네이버 지도에서 보기", naver_map_search_url(name, address))
-                if r.get("link"):
-                    st.link_button("🔗 네이버/예약 링크", r["link"])
-
+            # ✅ 블로그 링크 옆에 '작은 썸네일' 표시
             if show_reviews:
                 q = make_review_query(name, address)
                 with st.expander("🖼️ 블로그 후기 보기"):
@@ -1174,9 +921,20 @@ if run_search or reroll:
                         st.write("관련 블로그 후기를 찾지 못했어요.")
                     else:
                         for p in blog_posts[:review_display]:
-                            st.markdown(f"- [{p['title']}]({p['link']})")
-                            if p.get("desc"):
-                                st.caption(p["desc"])
+                            thumb = (p.get("thumbnail") or "").strip()
+
+                            # “링크 바로 옆” 느낌을 위해: 작은 컬럼에 썸네일, 큰 컬럼에 링크/요약
+                            c1, c2 = st.columns([1, 6])
+                            with c1:
+                                if thumb:
+                                    # 작게 표시 (너무 커지지 않게 width 사용)
+                                    st.image(thumb, width=64)
+                                else:
+                                    st.write("")  # 빈 공간 유지
+                            with c2:
+                                st.markdown(f"- [{p['title']}]({p['link']})")
+                                if p.get("desc"):
+                                    st.caption(p["desc"])
 
             st.divider()
 
