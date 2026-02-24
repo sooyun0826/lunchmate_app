@@ -14,7 +14,6 @@ from openai import OpenAI
 # ===============================
 # 기본 디폴트 설정 (초기값)
 # ===============================
-# ✅ 인원수 디폴트: '상관없음'
 PEOPLE_OPTIONS = ["상관없음"] + [f"{i}명" for i in range(1, 11)]
 DEFAULT_PEOPLE_INDEX = 0
 
@@ -41,8 +40,8 @@ BLOG_PER_PLACE_FOR_SCORING = 3
 # 스코어링 이후 LLM에 넘길 후보 수
 LLM_RERANK_POOL = 25
 
-# ✅ 결과 카드 이미지(이미지 검색 API)  (※ 이번 수정에서 "표시만 제거"하므로 값/함수는 남겨둠)
-IMAGE_PER_PLACE = 1  # 1~5 (네이버 이미지 API display 제한에 맞춰 5 이하로 유지)
+# ✅ 결과 카드 이미지(이미지 검색 API)  (표시만 제거했지만 함수는 남겨둠)
+IMAGE_PER_PLACE = 1
 
 
 # ===============================
@@ -100,6 +99,9 @@ def parse_people_value(choice: str) -> int:
     return int(m.group(1)) if m else 0
 
 
+# ===============================
+# 네이버 API
+# ===============================
 def naver_local_search(
     query: str,
     client_id: str,
@@ -317,12 +319,6 @@ def naver_image_search_cached(
     display: int = 1,
     sort: str = "sim",
 ):
-    """
-    네이버 이미지 검색 API
-    https://openapi.naver.com/v1/search/image
-    - items[].thumbnail : 섬네일 URL
-    - items[].link      : 원본 이미지 URL
-    """
     url = "https://openapi.naver.com/v1/search/image"
     headers = {
         "X-Naver-Client-Id": client_id,
@@ -332,8 +328,8 @@ def naver_image_search_cached(
         "query": query,
         "display": max(1, min(display, 5)),
         "start": 1,
-        "sort": sort,        # sim/date
-        "filter": "all",     # all/large/medium/small
+        "sort": sort,
+        "filter": "all",
     }
     r = requests.get(url, headers=headers, params=params, timeout=10)
     r.raise_for_status()
@@ -377,6 +373,114 @@ SOLO_CATEGORY_PENALTY = ["고기", "삼겹", "갈비", "한우", "무한리필",
 
 BUDGET_POSITIVE = ["가성비", "저렴", "착한가격", "만원", "만원대", "점심특선", "세트", "백반"]
 BUDGET_NEGATIVE = ["오마카세", "파인다이닝", "코스", "프리미엄", "고급", "비싼", "고가"]
+
+
+# ===============================
+# ✅ 업종 판별 + 방문 모드 필터 (이번 고도화 핵심)
+# ===============================
+STUDY_CAFE_KWS = ["스터디카페", "스터디 카페", "study cafe", "study카페", "스터디룸", "스터디 룸", "독서실"]
+CAFE_KWS = ["카페", "커피", "디저트", "베이커리", "브런치", "tea", "티", "아이스크림", "젤라또"]
+
+
+def is_study_cafe(candidate: Dict[str, Any]) -> bool:
+    name = normalize_text(candidate.get("name", ""))
+    cat = normalize_text(candidate.get("category", ""))
+    blob = f"{name} {cat}"
+    return any(k in blob for k in [normalize_text(x) for x in STUDY_CAFE_KWS])
+
+
+def is_cafe_like(candidate: Dict[str, Any]) -> bool:
+    """스터디카페는 별도 처리. 일반 카페/디저트/베이커리만 True."""
+    if is_study_cafe(candidate):
+        return False
+    name = normalize_text(candidate.get("name", ""))
+    cat = normalize_text(candidate.get("category", ""))
+    blob = f"{name} {cat}"
+    return any(k in blob for k in [normalize_text(x) for x in CAFE_KWS])
+
+
+def infer_visit_mode(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    - meal_mode: 식사(아침/점심/저녁)면 True
+    - cafe_mode: 카페/카공 목적이면 True
+    - allow_study_cafe: '스터디카페'를 명시했을 때만 True
+    """
+    visit_type = (payload.get("visit_type") or "").strip()
+    situation = payload.get("situation", "") or ""
+    prefer = payload.get("prefer", "") or ""
+    quick_tags = payload.get("quick_tags", []) or []
+
+    blob = " ".join([situation, prefer, " ".join(quick_tags), visit_type]).strip()
+    b = normalize_text(blob)
+
+    # 스터디카페는 "명시"했을 때만 허용
+    allow_study_cafe = any_kw(b, STUDY_CAFE_KWS)
+
+    # 카페/카공 모드 신호
+    cafe_signals = ["카공", "카페", "커피", "디저트", "베이커리", "공부", "노트북", "작업", "스터디"]  # '스터디'는 allow_study_cafe와 분리
+    cafe_mode = (visit_type == "카페/디저트") or any_kw(b, cafe_signals)
+
+    # 식사 모드 신호
+    meal_mode = visit_type in ["아침", "점심", "저녁"]
+    # '상관없음'인데도 점심/저녁/밥/식사 강하게 말하면 식사로 간주 (카페 모드가 아닐 때만)
+    if not meal_mode and not cafe_mode:
+        meal_signals = ["점심", "저녁", "아침", "밥", "식사", "먹을", "끼니"]
+        meal_mode = any_kw(b, meal_signals)
+
+    # 둘 다 True가 될 수 있는데(예: "점심 먹고 카페") 이번 요구사항은 "식사면 카페 추천 X"가 우선이므로
+    # visit_type이 식사면 meal 우선. 카페 목적은 visit_type이 카페/디저트일 때 강제.
+    if visit_type in ["아침", "점심", "저녁"]:
+        cafe_mode = False
+    if visit_type == "카페/디저트":
+        meal_mode = False
+
+    return {
+        "meal_mode": bool(meal_mode),
+        "cafe_mode": bool(cafe_mode),
+        "allow_study_cafe": bool(allow_study_cafe),
+    }
+
+
+def apply_visit_filters(payload: Dict[str, Any], candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    요구사항 반영:
+    1) 식사(아침/점심/저녁) => 카페/디저트/베이커리/스터디카페 제외
+    2) 카페/카공 => 음식점 제외
+    3) 카페/카공 시 스터디카페 제외 (단, '스터디카페' 명시 시에만 허용)
+    """
+    mode = infer_visit_mode(payload)
+    meal_mode = mode["meal_mode"]
+    cafe_mode = mode["cafe_mode"]
+    allow_study = mode["allow_study_cafe"]
+
+    out = []
+    for c in candidates:
+        study = is_study_cafe(c)
+        cafe = is_cafe_like(c)
+
+        if meal_mode:
+            # 식사 모드: 카페류/스터디카페 다 제외
+            if cafe or study:
+                continue
+            out.append(c)
+            continue
+
+        if cafe_mode:
+            # 카페 모드: 음식점 제외, 카페류만
+            # 스터디카페는 allow_study가 True일 때만
+            if study and not allow_study:
+                continue
+            if cafe or (study and allow_study):
+                out.append(c)
+            continue
+
+        # 상관없음 모드:
+        # - 스터디카페는 명시했을 때만 남김(기본은 제외)
+        if study and not allow_study:
+            continue
+        out.append(c)
+
+    return out
 
 
 def infer_intents(payload: Dict[str, Any]) -> Dict[str, bool]:
@@ -451,7 +555,6 @@ def score_candidate_for_payload(
             score -= penalty
             reasons.append(f"가성비: 고가 시그널({neg})(-{penalty})")
 
-    # ✅ 빠른 태그 반영(약~중간)
     quick_tags = payload.get("quick_tags", []) or []
     if quick_tags:
         if any_kw(blob, quick_tags):
@@ -464,6 +567,7 @@ def score_candidate_for_payload(
             score += 35
             reasons.append("선택한 음식/카페 종류 매칭(+35)")
 
+    # (기존 visit_type 가점/감점은 유지하되, 최종 후보는 하드필터로 이미 정리됨)
     visit = payload.get("visit_type", "상관없음")
     if visit == "카페/디저트":
         if any_kw(blob, ["카페", "디저트", "베이커리", "커피"]):
@@ -509,7 +613,6 @@ def solo_gate_filter(sorted_candidates: List[Dict[str, Any]]) -> List[Dict[str, 
 # ===============================
 st.set_page_config(page_title="LunchMate 🍱", layout="wide")
 
-# ✅ 스크롤 잠김 방지 CSS
 st.markdown(
     """
     <style>
@@ -532,13 +635,12 @@ if "candidate_cache_key" not in st.session_state:
     st.session_state["candidate_cache_key"] = None
 if "candidates" not in st.session_state:
     st.session_state["candidates"] = []
-# ✅ 메인에 위치한 빠른 태그 상태 유지
 if "quick_tags_main" not in st.session_state:
     st.session_state["quick_tags_main"] = []
 
 
 # ===============================
-# 사이드바 (✅ 빠른 태그 제거!)
+# 사이드바
 # ===============================
 st.sidebar.header("🕒 매장 방문 목적")
 visit_type = st.sidebar.selectbox(
@@ -572,7 +674,7 @@ debug_mode = st.sidebar.checkbox("🧪 디버그(후보 점수/필터 보기)", 
 
 
 # ===============================
-# 메인 입력 (✅ 빠른 태그를 프롬프트 바로 아래로 이동)
+# 메인 입력
 # ===============================
 st.subheader("📝 희망 조건을 자유롭게 입력해 주세요")
 situation = st.text_area(
@@ -580,13 +682,13 @@ situation = st.text_area(
     placeholder="예: 신촌역에서 친구와 점심 먹을거야. 가성비 좋은 중식 음식점 추천해줘. / 잠실에서 카공하기 좋은 카페 찾아줘.",
 )
 
-# ✅ 프롬프트 입력란 바로 아래에 '빠른 태그' 배치
 st.markdown("### 🧩 빠른 태그(복수 선택 가능)")
 QUICK_TAGS = [
     "혼밥", "조용한", "가성비", "웨이팅 적은", "매운 음식",
     "데이트", "단체 가능", "포장/테이크아웃",
     "다이어트", "비건", "샐러드", "디저트", "브런치",
     "야식", "술/안주", "카공",
+    "스터디카페",  # ✅ 사용자가 명시하면 추천 허용
 ]
 quick_tags = st.multiselect(
     "원하는 키워드를 선택하세요",
@@ -595,7 +697,6 @@ quick_tags = st.multiselect(
     key="quick_tags_main",
 )
 
-# ✅ 적용 표시(사용자 가시성)
 if quick_tags:
     st.success(f"✅ 빠른 태그 적용됨: {', '.join(quick_tags)}")
 else:
@@ -629,7 +730,7 @@ def generate_queries(client: OpenAI, payload: Dict[str, Any]) -> List[str]:
         "아침": "아침/브런치",
         "점심": "점심",
         "저녁": "저녁/술자리",
-        "카페/디저트": "카페/디저트",
+        "카페/디저트": "카페/디저트/카공",
         "상관없음": "맛집/카페",
     }.get(visit, "맛집/카페")
 
@@ -739,6 +840,17 @@ def recommend_from_candidates(
 ) -> Dict[str, Any]:
     intents = infer_intents(payload)
     must_notes = []
+
+    # ✅ 방문 모드 강제(LLM에게도 명확히 지시)
+    mode = infer_visit_mode(payload)
+    if mode["meal_mode"]:
+        must_notes.append("- 방문 목적이 식사(아침/점심/저녁)이다. 카페/디저트/베이커리/스터디카페는 추천하지 마라.")
+    if mode["cafe_mode"]:
+        if mode["allow_study_cafe"]:
+            must_notes.append("- 방문 목적이 카페/카공이다. 음식점은 추천하지 마라. 스터디카페는 사용자가 명시했으므로 허용된다.")
+        else:
+            must_notes.append("- 방문 목적이 카페/카공이다. 음식점과 스터디카페는 추천하지 마라.")
+
     if intents.get("solo"):
         must_notes.append("- 사용자가 혼밥/1인식사를 원한다. 단체/회식/모임 중심 장소는 우선 배제하라.")
         must_notes.append("- 바자리/카운터/1인식사 힌트가 있거나 혼자 먹기 편한 형태를 우선하라.")
@@ -832,7 +944,7 @@ if run_search or reroll:
         "people": people,  # 0이면 상관없음
         "distance_pref": distance,
         "food_type": food_type,
-        "quick_tags": quick_tags,  # ✅ 이제 메인 입력 아래에서 선택된 값
+        "quick_tags": quick_tags,
         "exclude": exclude_text.strip(),
         "prefer": prefer_text.strip(),
         "blog_sort": blog_sort_param,
@@ -868,16 +980,25 @@ if run_search or reroll:
             st.warning("조건에 맞는 실제 후보를 찾지 못했어요. 키워드를 넓혀 다시 시도해 주세요.")
             st.stop()
 
+        # ✅✅✅ 이번 고도화: 방문 목적에 따른 업종 하드 필터 적용
+        candidates = apply_visit_filters(payload, candidates)
+
+        if not candidates:
+            st.warning("방문 목적 조건(식사/카페/카공/스터디카페)에 맞는 후보를 찾지 못했어요. 키워드를 조금 바꿔 다시 시도해 주세요.")
+            st.stop()
+
         st.session_state["candidate_cache_key"] = cache_key
         st.session_state["candidates"] = candidates
 
     # 2) 후보 스코어링 + 혼밥 게이트 필터
     with st.spinner("후보를 정교하게 선별하는 중..."):
-        scored_candidates = score_and_prepare_candidates(payload, candidates, blog_sort_param)
+        # 안전장치로 한 번 더 적용 (캐시 후보가 외부에서 바뀌는 경우 대비)
+        filtered_candidates = apply_visit_filters(payload, candidates)
+        scored_candidates = score_and_prepare_candidates(payload, filtered_candidates, blog_sort_param)
 
     # (검증: 후보 보기)
     with st.expander("🔎 이번 추천에 사용된 후보 정보(검증)"):
-        st.write(f"- 후보 수(원본): **{len(candidates)}개**")
+        st.write(f"- 후보 수(원본/필터 후): **{len(candidates)}개**")
         st.write(f"- 후보 수(스코어링/필터 후): **{len(scored_candidates)}개**")
         sample_df = pd.DataFrame(scored_candidates[:30])
         cols = [c for c in ["name", "category", "address", "_score"] if c in sample_df.columns]
@@ -907,8 +1028,7 @@ if run_search or reroll:
     recommendations = recommendations[:TOP_K]
     recommendations = ensure_k_recommendations(recommendations, scored_candidates, TOP_K)
 
-    fixed_summary = f"조건에 맞는 추천 TOP {TOP_K} 결과입니다."
-    st.success(f"✅ **{fixed_summary}**")
+    st.success(f"✅ **조건에 맞는 추천 TOP {TOP_K} 결과입니다.**")
     st.subheader(f"🏆 추천 TOP {TOP_K} (네이버 후보 기반)")
 
     for r in recommendations:
@@ -918,10 +1038,7 @@ if run_search or reroll:
         reason = r.get("reason", "")
         tags = r.get("tags", [])
 
-        # ✅✅✅ (수정) 추천 카드에서 "식당 사진"만 제거
-        # - 기존 img_query / naver_image_search_cached / st.image 표시를 전부 제거
-        # - 정보 영역은 그대로 유지
-
+        # ✅ 식당별 사진은 표시하지 않음 (유지)
         with st.container():
             st.markdown(f"### {r.get('rank', '')}️⃣ {name}")
             if tags and isinstance(tags, list):
