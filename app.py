@@ -166,15 +166,24 @@ def filter_candidates(candidates: List[Dict[str, str]]) -> List[Dict[str, str]]:
 
 
 def extract_json_from_text(text: str) -> dict:
+    """
+    모델이 JSON만 주는 게 최선이지만,
+    혹시라도 텍스트가 섞이면 JSON 오브젝트 부분만 최대한 발췌.
+    """
     text = (text or "").strip()
 
+    # 1) 바로 JSON이면 최고
     try:
-        return json.loads(text)
+        obj = json.loads(text)
+        if isinstance(obj, dict):
+            return obj
     except json.JSONDecodeError:
         pass
 
+    # 2) ```json ... ``` 제거
     text = text.replace("```json", "```").replace("```", "")
 
+    # 3) 첫 { ~ 마지막 } 범위만 잘라 파싱
     start = text.find("{")
     end = text.rfind("}")
     if start == -1 or end == -1 or end <= start:
@@ -191,23 +200,35 @@ def llm_json(
     model: str = "gpt-4.1-mini",
     retries: int = 2
 ) -> dict:
+    """
+    ✅ 핵심 개선:
+    - response_format=json_object로 'JSON만' 받도록 강제 (지원 모델이면 파싱 실패 확 줄어듦)
+    - 실패 시 재시도 + 그래도 실패하면 예외를 그대로 올려서 상위에서 원인 표시 가능
+    """
+    last_err: Optional[Exception] = None
+
     for attempt in range(retries + 1):
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            temperature=0.3,
-        )
-        text = resp.choices[0].message.content or ""
         try:
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                temperature=0.2,
+                # 일부 환경/모델에서 미지원이면 예외가 날 수 있어 try로 감쌈
+                response_format={"type": "json_object"},
+            )
+            text = resp.choices[0].message.content or ""
             return extract_json_from_text(text)
-        except json.JSONDecodeError:
-            if attempt == retries:
-                raise
-            user = user + "\n\n다른 텍스트 없이 JSON만 다시 출력해."
-    raise RuntimeError("Unreachable")
+        except Exception as e:
+            last_err = e
+            # 다음 시도에서는 더 강하게 JSON만 요구
+            user = user + "\n\n반드시 다른 텍스트 없이 JSON 오브젝트만 출력해."
+            continue
+
+    # 마지막 예외를 그대로 전달(상위에서 실제 원인 표시)
+    raise last_err if last_err else RuntimeError("Unknown LLM error")
 
 
 def ensure_k_recommendations(
@@ -296,13 +317,9 @@ def naver_blog_search_cached(
     return items
 
 
-# ✅✅✅ 핵심 수정: 블로그 링크에서 og:image(대표 이미지) 뽑아서 썸네일로 사용
+# ✅ 블로그 링크에서 og:image(대표 이미지) 뽑아 썸네일로 사용
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
 def get_blog_thumbnail_cached(url: str) -> str:
-    """
-    블로그/포스트 링크 HTML을 받아서 대표 이미지(og:image / twitter:image)를 추출.
-    - 네이버 블로그 검색 API 응답에는 썸네일이 없거나 불안정해서, 링크 페이지에서 직접 뽑는 방식이 가장 확실함.
-    """
     if not url:
         return ""
 
@@ -315,19 +332,16 @@ def get_blog_thumbnail_cached(url: str) -> str:
     }
 
     try:
-        # redirect 따라가서 최종 HTML 확보
         r = requests.get(url, headers=headers, timeout=8, allow_redirects=True)
         r.raise_for_status()
         html_text = r.text or ""
 
-        # og:image 우선
         m = re.search(
             r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
             html_text,
             re.IGNORECASE,
         )
         if not m:
-            # twitter:image fallback
             m = re.search(
                 r'<meta[^>]+name=["\']twitter:image["\'][^>]+content=["\']([^"\']+)["\']',
                 html_text,
@@ -336,7 +350,6 @@ def get_blog_thumbnail_cached(url: str) -> str:
 
         if m:
             img = (m.group(1) or "").strip()
-            # 일부는 // 로 시작할 수 있어서 보정
             if img.startswith("//"):
                 img = "https:" + img
             return img
@@ -539,7 +552,7 @@ if "quick_tags_main" not in st.session_state:
 
 
 # ===============================
-# 사이드바 (빠른 태그 제거!)
+# 사이드바
 # ===============================
 st.sidebar.header("🕒 매장 방문 목적")
 visit_type = st.sidebar.selectbox(
@@ -573,7 +586,7 @@ debug_mode = st.sidebar.checkbox("🧪 디버그(후보 점수/필터 보기)", 
 
 
 # ===============================
-# 메인 입력 (빠른 태그를 프롬프트 바로 아래로)
+# 메인 입력
 # ===============================
 st.subheader("📝 희망 조건을 자유롭게 입력해 주세요")
 situation = st.text_area(
@@ -607,6 +620,70 @@ def require_secrets_or_stop():
     if not (naver_client_id and naver_client_secret and openai_api_key):
         st.error("서비스 설정 오류가 발생했습니다. 잠시 후 다시 시도해 주세요.")
         st.stop()
+
+
+# ✅✅✅ 추가: LLM 실패해도 돌아가는 규칙 기반 쿼리 fallback
+def heuristic_queries(payload: Dict[str, Any]) -> List[str]:
+    start = (payload.get("start_location") or "").strip()
+    visit = payload.get("visit_type", "상관없음")
+    food = payload.get("food_type") or []
+    qt = payload.get("quick_tags") or []
+    prefer = payload.get("prefer") or ""
+
+    if not start:
+        # 출발지 없으면 최소한 상황 텍스트 기반으로
+        start = (payload.get("situation") or "").strip()
+        start = start.split()[0] if start else "근처"
+
+    visit_hint = {
+        "아침": ["아침", "브런치", "샌드위치"],
+        "점심": ["점심", "맛집", "밥집"],
+        "저녁": ["저녁", "맛집", "술집", "안주"],
+        "카페/디저트": ["카페", "디저트", "베이커리"],
+        "상관없음": ["맛집", "카페"],
+    }.get(visit, ["맛집", "카페"])
+
+    # 음식 타입/태그에서 검색에 강한 단어만 뽑기
+    keywords = []
+    keywords.extend(food[:2])
+    keywords.extend([t for t in qt if t in ["혼밥", "가성비", "조용한", "카공", "디저트", "브런치", "술/안주"]][:2])
+
+    # prefer에도 음식 키워드가 있을 수 있어 일부 반영
+    if prefer:
+        for k in ["가성비", "조용", "카공", "디저트", "브런치", "혼밥"]:
+            if k in prefer and k not in keywords:
+                keywords.append(k)
+
+    # 조합 생성
+    base = [start]
+    combos = []
+
+    # 1) 가장 기본
+    combos.append(f"{start} {visit_hint[0]}")
+    # 2) 방문 목적 + 일반 키워드
+    if len(visit_hint) > 1:
+        combos.append(f"{start} {visit_hint[1]}")
+    # 3) 음식 타입 반영
+    if keywords:
+        combos.append(f"{start} {keywords[0]} {visit_hint[0]}")
+    if len(keywords) > 1:
+        combos.append(f"{start} {keywords[1]} {visit_hint[0]}")
+
+    # 4) 태그/선호 기반
+    for k in keywords[:3]:
+        combos.append(f"{start} {k}")
+
+    # 중복 제거 + 길이 정리
+    uniq = []
+    seen = set()
+    for q in combos:
+        q = re.sub(r"\s+", " ", q).strip()
+        if not q or q in seen:
+            continue
+        seen.add(q)
+        uniq.append(q)
+
+    return uniq[:MAX_QUERIES]
 
 
 def generate_queries(client: OpenAI, payload: Dict[str, Any]) -> List[str]:
@@ -648,10 +725,15 @@ def generate_queries(client: OpenAI, payload: Dict[str, Any]) -> List[str]:
         "네이버 지역검색에 넣을 queries 3~6개를 만들어줘."
     )
 
-    q_data = llm_json(client, system_query, user_query)
-    queries = q_data.get("queries", [])
-    queries = [q.strip() for q in queries if isinstance(q, str) and q.strip()]
+    # ✅ LLM 시도 → 실패하면 heuristic fallback
+    try:
+        q_data = llm_json(client, system_query, user_query)
+        queries = q_data.get("queries", [])
+        queries = [q.strip() for q in queries if isinstance(q, str) and q.strip()]
+    except Exception:
+        queries = heuristic_queries(payload)
 
+    # 출발지 강제 반영
     start = (payload.get("start_location") or "").strip()
     if start:
         patched = []
@@ -662,10 +744,16 @@ def generate_queries(client: OpenAI, payload: Dict[str, Any]) -> List[str]:
     uniq = []
     seen = set()
     for q in queries:
-        if q in seen:
+        q = re.sub(r"\s+", " ", q).strip()
+        if not q or q in seen:
             continue
         seen.add(q)
         uniq.append(q)
+
+    # 최소 3개 보장(정말 이상하게 비면 heuristic 한 번 더)
+    if len(uniq) < 3:
+        uniq = heuristic_queries(payload)
+
     return uniq[:MAX_QUERIES]
 
 
@@ -804,7 +892,7 @@ def recommend_from_candidates(
 
 
 # ===============================
-# 버튼 (UX: 재추천)
+# 버튼
 # ===============================
 btn1, btn2 = st.columns([1, 1])
 with btn1:
@@ -838,14 +926,16 @@ if run_search or reroll:
     }
     cache_key = build_cache_key(payload)
 
+    # 1) 후보 수집(캐시)
     if reroll and st.session_state.get("candidates") and st.session_state.get("candidate_cache_key") == cache_key:
         candidates = st.session_state["candidates"]
     else:
         with st.spinner("조건을 분석 중..."):
             try:
                 queries = generate_queries(client, payload)
-            except Exception:
-                st.error("검색어 생성에 실패했어요. (OpenAI 응답 파싱 실패)")
+            except Exception as e:
+                # ✅ 실제 원인을 보여주도록 개선
+                st.error(f"검색어 생성에 실패했어요. (원인: {type(e).__name__}: {e})")
                 st.stop()
 
         if not queries:
@@ -869,6 +959,7 @@ if run_search or reroll:
         st.session_state["candidate_cache_key"] = cache_key
         st.session_state["candidates"] = candidates
 
+    # 2) 후보 스코어링
     with st.spinner("후보를 정교하게 선별하는 중..."):
         scored_candidates = score_and_prepare_candidates(payload, candidates, blog_sort_param)
 
@@ -884,12 +975,13 @@ if run_search or reroll:
             for c in scored_candidates[:10]:
                 st.write(f"- **{c.get('name')}** ({c.get('_score')}): {c.get('_score_notes')}")
 
+    # 3) LLM 최종 추천
     with st.spinner("후보 중에서 최적의 장소를 고르는 중..."):
         try:
             pool = scored_candidates[:LLM_RERANK_POOL]
             r_data = recommend_from_candidates(client, payload, pool)
-        except Exception:
-            st.error("추천 결과 생성에 실패했어요. (OpenAI 응답 파싱 실패)")
+        except Exception as e:
+            st.error(f"추천 결과 생성에 실패했어요. (원인: {type(e).__name__}: {e})")
             st.stop()
 
     recommendations = r_data.get("recommendations", [])
@@ -925,7 +1017,7 @@ if run_search or reroll:
             if r.get("link"):
                 st.link_button("🔗 네이버/예약 링크", r["link"])
 
-            # ✅✅✅ 여기만 “썸네일 표시”를 제대로 보이게 수정
+            # ✅ 블로그 후기 링크 옆 썸네일
             if show_reviews:
                 q = make_review_query(name, address)
                 with st.expander("🖼️ 블로그 후기 보기"):
@@ -946,13 +1038,12 @@ if run_search or reroll:
                         for p in blog_posts[:review_display]:
                             thumb_url = get_blog_thumbnail_cached(p.get("link", ""))
 
-                            # 링크 옆에 “작게” 썸네일 표시
                             c_thumb, c_text = st.columns([1, 8], vertical_alignment="center")
                             with c_thumb:
                                 if thumb_url:
                                     st.image(thumb_url, width=64)
                                 else:
-                                    st.write("")  # 자리 유지
+                                    st.write("")
                             with c_text:
                                 st.markdown(f"[{p['title']}]({p['link']})")
                                 if p.get("desc"):
