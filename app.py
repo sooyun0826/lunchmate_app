@@ -40,7 +40,7 @@ BLOG_PER_PLACE_FOR_SCORING = 3
 # 스코어링 이후 LLM에 넘길 후보 수
 LLM_RERANK_POOL = 25
 
-# ✅ 결과 카드 이미지(이미지 검색 API)  (표시만 제거했지만 함수는 남겨둠)
+# ✅ 결과 카드 이미지(이미지 검색 API) (표시만 제거했지만 함수는 남겨둠)
 IMAGE_PER_PLACE = 1
 
 
@@ -376,10 +376,13 @@ BUDGET_NEGATIVE = ["오마카세", "파인다이닝", "코스", "프리미엄", 
 
 
 # ===============================
-# ✅ 업종 판별 + 방문 모드 필터 (이번 고도화 핵심)
+# ✅ 업종 판별 + 방문 모드 필터
 # ===============================
 STUDY_CAFE_KWS = ["스터디카페", "스터디 카페", "study cafe", "study카페", "스터디룸", "스터디 룸", "독서실"]
 CAFE_KWS = ["카페", "커피", "디저트", "베이커리", "브런치", "tea", "티", "아이스크림", "젤라또"]
+
+# ✅✅✅ 이번 요청 반영: "맛집/식당" 같은 강한 식사 의도 키워드
+STRONG_MEAL_KWS = ["맛집", "식당", "밥집", "레스토랑", "restaurant"]
 
 
 def is_study_cafe(candidate: Dict[str, Any]) -> bool:
@@ -404,6 +407,10 @@ def infer_visit_mode(payload: Dict[str, Any]) -> Dict[str, Any]:
     - meal_mode: 식사(아침/점심/저녁)면 True
     - cafe_mode: 카페/카공 목적이면 True
     - allow_study_cafe: '스터디카페'를 명시했을 때만 True
+
+    ✅ 개선:
+    - 프롬프트에 '맛집/식당/밥집/레스토랑' 등이 들어가면 강한 식사 의도로 보고
+      (visit_type이 '카페/디저트'가 아닌 한) cafe_mode를 강제로 꺼버린다.
     """
     visit_type = (payload.get("visit_type") or "").strip()
     situation = payload.get("situation", "") or ""
@@ -413,22 +420,25 @@ def infer_visit_mode(payload: Dict[str, Any]) -> Dict[str, Any]:
     blob = " ".join([situation, prefer, " ".join(quick_tags), visit_type]).strip()
     b = normalize_text(blob)
 
-    # 스터디카페는 "명시"했을 때만 허용
     allow_study_cafe = any_kw(b, STUDY_CAFE_KWS)
 
     # 카페/카공 모드 신호
-    cafe_signals = ["카공", "카페", "커피", "디저트", "베이커리", "공부", "노트북", "작업", "스터디"]  # '스터디'는 allow_study_cafe와 분리
+    cafe_signals = ["카공", "카페", "커피", "디저트", "베이커리", "공부", "노트북", "작업", "스터디"]
     cafe_mode = (visit_type == "카페/디저트") or any_kw(b, cafe_signals)
 
-    # 식사 모드 신호
+    # 식사 모드 신호(기존)
     meal_mode = visit_type in ["아침", "점심", "저녁"]
-    # '상관없음'인데도 점심/저녁/밥/식사 강하게 말하면 식사로 간주 (카페 모드가 아닐 때만)
-    if not meal_mode and not cafe_mode:
+    if not meal_mode:
         meal_signals = ["점심", "저녁", "아침", "밥", "식사", "먹을", "끼니"]
         meal_mode = any_kw(b, meal_signals)
 
-    # 둘 다 True가 될 수 있는데(예: "점심 먹고 카페") 이번 요구사항은 "식사면 카페 추천 X"가 우선이므로
-    # visit_type이 식사면 meal 우선. 카페 목적은 visit_type이 카페/디저트일 때 강제.
+    # ✅✅✅ 강한 식사 의도 키워드가 있으면 (visit_type이 카페로 명시되지 않는 한) 식사 우선
+    strong_meal_hint = any_kw(b, STRONG_MEAL_KWS)
+    if strong_meal_hint and visit_type != "카페/디저트":
+        meal_mode = True
+        cafe_mode = False
+
+    # 둘 다 True가 되는 상황 정리(명시 선택 우선)
     if visit_type in ["아침", "점심", "저녁"]:
         cafe_mode = False
     if visit_type == "카페/디저트":
@@ -443,10 +453,10 @@ def infer_visit_mode(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 def apply_visit_filters(payload: Dict[str, Any], candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    요구사항 반영:
     1) 식사(아침/점심/저녁) => 카페/디저트/베이커리/스터디카페 제외
     2) 카페/카공 => 음식점 제외
     3) 카페/카공 시 스터디카페 제외 (단, '스터디카페' 명시 시에만 허용)
+    4) ✅ '맛집/식당' 등 강한 식사 의도 키워드가 있으면 meal_mode로 강제되어 카페가 걸러짐
     """
     mode = infer_visit_mode(payload)
     meal_mode = mode["meal_mode"]
@@ -459,23 +469,19 @@ def apply_visit_filters(payload: Dict[str, Any], candidates: List[Dict[str, Any]
         cafe = is_cafe_like(c)
 
         if meal_mode:
-            # 식사 모드: 카페류/스터디카페 다 제외
             if cafe or study:
                 continue
             out.append(c)
             continue
 
         if cafe_mode:
-            # 카페 모드: 음식점 제외, 카페류만
-            # 스터디카페는 allow_study가 True일 때만
             if study and not allow_study:
                 continue
             if cafe or (study and allow_study):
                 out.append(c)
             continue
 
-        # 상관없음 모드:
-        # - 스터디카페는 명시했을 때만 남김(기본은 제외)
+        # 상관없음 모드: 스터디카페는 명시했을 때만
         if study and not allow_study:
             continue
         out.append(c)
@@ -567,7 +573,6 @@ def score_candidate_for_payload(
             score += 35
             reasons.append("선택한 음식/카페 종류 매칭(+35)")
 
-    # (기존 visit_type 가점/감점은 유지하되, 최종 후보는 하드필터로 이미 정리됨)
     visit = payload.get("visit_type", "상관없음")
     if visit == "카페/디저트":
         if any_kw(blob, ["카페", "디저트", "베이커리", "커피"]):
@@ -584,7 +589,7 @@ def score_candidate_for_payload(
         if any_kw(blob, ["술", "안주", "호프", "포차"]):
             score += 15 if visit == "저녁" else 0
 
-    score += 10  # 네이버 후보 기반 신뢰 가점
+    score += 10
 
     meta = {"score": score, "score_notes": reasons[:8]}
     return score, meta
@@ -679,7 +684,7 @@ debug_mode = st.sidebar.checkbox("🧪 디버그(후보 점수/필터 보기)", 
 st.subheader("📝 희망 조건을 자유롭게 입력해 주세요")
 situation = st.text_area(
     "자유롭게 상황을 입력해 주세요(취향, 방문 지역, 인원 수, 식사 상황 등)",
-    placeholder="예: 신촌역에서 친구와 점심 먹을거야. 가성비 좋은 중식 음식점 추천해줘. / 잠실에서 카공하기 좋은 카페 찾아줘.",
+    placeholder="예: 신촌역 맛집 추천해줘 / 잠실에서 카공하기 좋은 카페 찾아줘.",
 )
 
 st.markdown("### 🧩 빠른 태그(복수 선택 가능)")
@@ -688,7 +693,7 @@ QUICK_TAGS = [
     "데이트", "단체 가능", "포장/테이크아웃",
     "다이어트", "비건", "샐러드", "디저트", "브런치",
     "야식", "술/안주", "카공",
-    "스터디카페",  # ✅ 사용자가 명시하면 추천 허용
+    "스터디카페",
 ]
 quick_tags = st.multiselect(
     "원하는 키워드를 선택하세요",
@@ -841,10 +846,9 @@ def recommend_from_candidates(
     intents = infer_intents(payload)
     must_notes = []
 
-    # ✅ 방문 모드 강제(LLM에게도 명확히 지시)
     mode = infer_visit_mode(payload)
     if mode["meal_mode"]:
-        must_notes.append("- 방문 목적이 식사(아침/점심/저녁)이다. 카페/디저트/베이커리/스터디카페는 추천하지 마라.")
+        must_notes.append("- 방문 목적이 식사(아침/점심/저녁 또는 맛집/식당 등)이다. 카페/디저트/베이커리/스터디카페는 추천하지 마라.")
     if mode["cafe_mode"]:
         if mode["allow_study_cafe"]:
             must_notes.append("- 방문 목적이 카페/카공이다. 음식점은 추천하지 마라. 스터디카페는 사용자가 명시했으므로 허용된다.")
@@ -941,7 +945,7 @@ if run_search or reroll:
         "visit_type": visit_type,
         "start_location": start_location.strip(),
         "situation": situation.strip(),
-        "people": people,  # 0이면 상관없음
+        "people": people,
         "distance_pref": distance,
         "food_type": food_type,
         "quick_tags": quick_tags,
@@ -980,9 +984,7 @@ if run_search or reroll:
             st.warning("조건에 맞는 실제 후보를 찾지 못했어요. 키워드를 넓혀 다시 시도해 주세요.")
             st.stop()
 
-        # ✅✅✅ 이번 고도화: 방문 목적에 따른 업종 하드 필터 적용
         candidates = apply_visit_filters(payload, candidates)
-
         if not candidates:
             st.warning("방문 목적 조건(식사/카페/카공/스터디카페)에 맞는 후보를 찾지 못했어요. 키워드를 조금 바꿔 다시 시도해 주세요.")
             st.stop()
@@ -992,11 +994,9 @@ if run_search or reroll:
 
     # 2) 후보 스코어링 + 혼밥 게이트 필터
     with st.spinner("후보를 정교하게 선별하는 중..."):
-        # 안전장치로 한 번 더 적용 (캐시 후보가 외부에서 바뀌는 경우 대비)
         filtered_candidates = apply_visit_filters(payload, candidates)
         scored_candidates = score_and_prepare_candidates(payload, filtered_candidates, blog_sort_param)
 
-    # (검증: 후보 보기)
     with st.expander("🔎 이번 추천에 사용된 후보 정보(검증)"):
         st.write(f"- 후보 수(원본/필터 후): **{len(candidates)}개**")
         st.write(f"- 후보 수(스코어링/필터 후): **{len(scored_candidates)}개**")
@@ -1009,7 +1009,7 @@ if run_search or reroll:
             for c in scored_candidates[:10]:
                 st.write(f"- **{c.get('name')}** ({c.get('_score')}): {c.get('_score_notes')}")
 
-    # 3) LLM 최종 추천(후보 중 선택)
+    # 3) LLM 최종 추천
     with st.spinner("후보 중에서 최적의 장소를 고르는 중..."):
         try:
             pool = scored_candidates[:LLM_RERANK_POOL]
@@ -1038,7 +1038,6 @@ if run_search or reroll:
         reason = r.get("reason", "")
         tags = r.get("tags", [])
 
-        # ✅ 식당별 사진은 표시하지 않음 (유지)
         with st.container():
             st.markdown(f"### {r.get('rank', '')}️⃣ {name}")
             if tags and isinstance(tags, list):
